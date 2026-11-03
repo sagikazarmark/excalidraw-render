@@ -1,0 +1,224 @@
+//! Frame-export parity for `focused.frame-export`: every frame target's SVG and
+//! PNG against the pinned official evidence, and its PDF for structure. The
+//! PDF viewer gates of the same case live in `harness_pdf_viewers`.
+
+use common::pdf_inspect::pdf_text;
+use std::fs;
+
+mod common;
+
+use common::raster::decode_png;
+use common::registered_cases::visual_class;
+use common::reports::assert_report_matches;
+use common::repository_root;
+use common::svg_raster::rasterize;
+use excalidraw_render::{FrameRenderRequest, OutputFormat, Renderer, SceneDocument};
+use excalidraw_render_compare::{compare, CanonicalRgba8, ComparisonMode};
+
+#[test]
+fn frame_svg_and_png_match_the_pinned_official_evidence() {
+    let case = repository_root().join("tests/conformance/cases/focused/frame-export");
+    let scene = SceneDocument::parse(&fs::read(case.join("scene.excalidraw")).unwrap())
+        .expect("approved frame scene is admitted");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(case.join("manifest.json")).unwrap()).unwrap();
+    let targets = manifest["targets"]
+        .as_array()
+        .expect("reference targets exist");
+    let frames = scene.frames().collect::<Vec<_>>();
+    assert_eq!(targets.len(), frames.len());
+    let renderer = Renderer::new();
+
+    for (index, (target, frame)) in targets.iter().zip(frames).enumerate() {
+        let ordinal = u32::try_from(index + 1).unwrap();
+        assert_eq!(target["frame_ordinal"], ordinal);
+        assert_eq!(target["frame_kind"], frame.kind().as_str());
+        assert_eq!(target["frame_name"].as_str(), frame.name());
+        let png_width = u32::try_from(
+            target["outputs"]["png"]["artifact"]["width"]
+                .as_u64()
+                .unwrap(),
+        )
+        .unwrap();
+        let png_height = u32::try_from(
+            target["outputs"]["png"]["artifact"]["height"]
+                .as_u64()
+                .unwrap(),
+        )
+        .unwrap();
+        let svg_width = u32::try_from(
+            target["outputs"]["svg"]["artifact"]["width"]
+                .as_u64()
+                .unwrap(),
+        )
+        .unwrap();
+        let svg_height = u32::try_from(
+            target["outputs"]["svg"]["artifact"]["height"]
+                .as_u64()
+                .unwrap(),
+        )
+        .unwrap();
+        let evidence = case.join(format!("evidence/frame-{ordinal}"));
+        // Each output is judged in the class its manifest declares, which the
+        // registry names and `verify-all` checks.
+        let class_of = |format: &str| {
+            visual_class(
+                target["outputs"][format]["visual_class"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("frame {ordinal} {format} declares a visual class")),
+            )
+        };
+
+        let png = renderer
+            .render_frame(
+                frame,
+                &FrameRenderRequest::builder(OutputFormat::Png)
+                    .build()
+                    .expect("PNG frame request is valid"),
+            )
+            .unwrap_or_else(|error| panic!("frame {ordinal} renders to PNG: {error}"));
+        assert_report_matches(
+            png.report(),
+            &case.join("expected-report.json"),
+            &format!("frame {ordinal} PNG"),
+        );
+        let candidate_png = decode_png(png.artifact().bytes()).into_canonical();
+        let reference_png = CanonicalRgba8::new(
+            png_width,
+            png_height,
+            fs::read(evidence.join("official-png.rgba")).unwrap(),
+        )
+        .expect("official PNG evidence is canonical RGBA8");
+        let png_comparison = compare(
+            &reference_png,
+            &candidate_png,
+            class_of("png"),
+            &[],
+            ComparisonMode::Canonical,
+        )
+        .expect("PNG dimensions match");
+        assert!(
+            png_comparison.passed(),
+            "frame {ordinal} PNG differs: changed_pixels={}, ssim={:?}",
+            png_comparison.whole.changed_pixels,
+            png_comparison.whole.ssim
+        );
+
+        let svg = renderer
+            .render_frame(
+                frame,
+                &FrameRenderRequest::builder(OutputFormat::Svg)
+                    .build()
+                    .expect("SVG frame request is valid"),
+            )
+            .unwrap_or_else(|error| panic!("frame {ordinal} renders to SVG: {error}"));
+        assert_eq!(svg.report(), png.report());
+        let candidate_svg = std::str::from_utf8(svg.artifact().bytes()).expect("SVG is UTF-8");
+        assert!(
+            candidate_svg.contains("viewBox=\"0 0 "),
+            "frame {ordinal} SVG has target-local bounds"
+        );
+        assert!(!candidate_svg.contains("data-frame-name"));
+        assert!(!candidate_svg.contains("data-frame-outline"));
+
+        let candidate_svg = rasterize_svg(
+            svg.artifact().bytes(),
+            svg_width,
+            svg_height,
+            &format!("frame {ordinal} candidate SVG"),
+        );
+        let official_svg = fs::read(evidence.join("official.svg")).unwrap();
+        let reference_svg = rasterize_svg(
+            &official_svg,
+            svg_width,
+            svg_height,
+            &format!("frame {ordinal} official SVG"),
+        );
+        let svg_comparison = compare(
+            &reference_svg,
+            &candidate_svg,
+            class_of("svg"),
+            &[],
+            ComparisonMode::PureRustSvg,
+        )
+        .expect("SVG dimensions match");
+        assert!(
+            svg_comparison.passed(),
+            "frame {ordinal} SVG differs: changed_pixels={}, ssim={:?}",
+            svg_comparison.whole.changed_pixels,
+            svg_comparison.whole.ssim
+        );
+
+        let pdf = renderer
+            .render_frame(
+                frame,
+                &FrameRenderRequest::builder(OutputFormat::Pdf)
+                    .build()
+                    .expect("PDF frame request is valid"),
+            )
+            .unwrap_or_else(|error| panic!("frame {ordinal} renders to PDF: {error}"));
+        assert_eq!(pdf.report(), png.report());
+        let repeated_pdf = renderer
+            .render_frame(
+                frame,
+                &FrameRenderRequest::builder(OutputFormat::Pdf)
+                    .build()
+                    .expect("repeated PDF frame request is valid"),
+            )
+            .unwrap_or_else(|error| panic!("frame {ordinal} repeats as PDF: {error}"));
+        assert_eq!(pdf.artifact().bytes(), repeated_pdf.artifact().bytes());
+        let pdf = pdf_text(pdf.artifact().bytes());
+        assert!(
+            pdf.contains("/MediaBox [0 0 "),
+            "frame {ordinal} has one PDF page"
+        );
+        assert!(
+            pdf.contains("/CropBox [0 0 "),
+            "frame {ordinal} clips to its target page"
+        );
+        assert!(
+            pdf.contains("/Count 1"),
+            "frame {ordinal} PDF has exactly one page"
+        );
+        assert!(
+            !pdf.contains("/Subtype /Image"),
+            "frame {ordinal} remains vector-first"
+        );
+        if ordinal == 1 {
+            // Colors at PDF's single precision (ADR-0021).
+            assert!(pdf.contains("0.8784314 0.19215687 0.19215687"));
+            assert!(pdf.contains("0.09803922 0.44313726 0.7607843"));
+            assert!(pdf.contains("0.6117647 0.21176471 0.70980394"));
+            assert!(!pdf.contains("0.18431373 0.61960787 0.26666668"));
+            assert!(!pdf.contains("0.9411765 0.54901963 0"));
+        }
+        if ordinal == 3 {
+            assert!(!pdf.contains("0.047058824 0.6509804 0.47058824"));
+        }
+        if ordinal == 4 {
+            assert!(pdf.contains("0.047058824 0.6509804 0.47058824"));
+        }
+        if ordinal == 7 {
+            assert!(
+                pdf.contains("/ToUnicode"),
+                "bound frame text remains selectable"
+            );
+            assert!(pdf.contains("/Subtype /Link"));
+            assert!(pdf.contains("/URI (https://example.com/frame)"));
+        }
+    }
+}
+
+/// Rasterizes a frame SVG through the shared font-aware rasterizer, which
+/// registers the faces the document embeds so its text is judged rather than
+/// dropped, and checks the raster is the size the evidence declares.
+fn rasterize_svg(bytes: &[u8], width: u32, height: u32, context: &str) -> CanonicalRgba8 {
+    let svg = std::str::from_utf8(bytes).expect("SVG is UTF-8");
+    let raster = rasterize(svg, context);
+    assert_eq!(
+        (raster.width(), raster.height()),
+        (width, height),
+        "{context}: the SVG rasterizes at the evidence's size"
+    );
+    raster
+}

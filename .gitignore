@@ -1,0 +1,27 @@
+/target/
+/tests/package-consumer/target/
+/tools/svg-viewer-rust/target/
+/tools/reference-oracle/dist/
+/tools/reference-oracle/frame-dist/
+/tools/reference-oracle/node_modules/
+/tools/pdf-harness/pdfjs/node_modules/
+/tmp/
+.DS_Store
+
+
+# Devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+
+# direnv
+.direnv
+
+# pre-commit
+.pre-commit-config.yaml
+
+target/
+.env
+
+# Claude Code
+/.claude/

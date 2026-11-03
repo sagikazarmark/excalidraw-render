@@ -1,0 +1,434 @@
+//! Shared coverage inventory and execution-result boundary (#85 / #86).
+//! Candidate evidence is not an ownership decision or an execution result.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use crate::conformance::{canonical_bytes, read_repository_file, repo_root, sha256};
+
+const INVENTORY: &str = "tests/conformance/coverage/inventory.json";
+const REQUIREMENTS: &str = "tests/conformance/coverage/requirements.json";
+const REGISTRY: &str = "tests/conformance/cases/registry.json";
+const INVENTORY_SCHEMA: &str = "excalidraw-render/coverage-inventory/v1";
+
+mod layers;
+mod ownership;
+mod pdf_judgments;
+pub use layers::{report_layers, verify_layers};
+pub use ownership::{
+    extend_ownership, ownership_catalog, rebind_ownership_catalog, record_case_owner,
+    record_closure_owner, record_exception_test_owner, record_library_test_owner,
+    record_representative_owner, record_test_owner, refresh_exception_test_owner_source,
+    refresh_library_test_owner_source, refresh_test_owner_source, refresh_test_owner_sources,
+    seed_ownership, test_group_filter, verify_ownership, verify_representative_owner,
+};
+pub use pdf_judgments::{generate_pdf_judgments, verify_pdf_judgments};
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct Descriptor {
+    path: String,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct Evidence {
+    source: Descriptor,
+    /// Exact source anchor, not a claim that the test has executed.
+    anchor: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct Requirement {
+    id: String,
+    issue: u64,
+    remaining: String,
+    evidence: Vec<Evidence>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct Requirements {
+    schema: String,
+    requirements: Vec<Requirement>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CoverageRow {
+    id: String,
+    /// Local coverage labels are candidates, never automatically primary owners.
+    candidates: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+enum Format {
+    Svg,
+    Png,
+    Pdf,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ExportTarget {
+    Scene {},
+    Frame { ordinal: u64 },
+}
+
+/// The same key is consumed by snapshot generation and every target collector.
+/// Its digest binds the whole manifest, scene, options, profile and asset catalog.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+struct CaseKey {
+    case: String,
+    variant: String,
+    export: ExportTarget,
+    format: Format,
+    inputs_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct Execution {
+    key: CaseKey,
+    options: Value,
+    /// Reference evidence exists for these formats; PDF absence remains visible.
+    reference_artifact: Option<Descriptor>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct Inventory {
+    schema: String,
+    compatibility_revision: u64,
+    scope: String,
+    sources: Vec<Descriptor>,
+    coverage: Vec<CoverageRow>,
+    executions: Vec<Execution>,
+    requirements: Vec<Requirement>,
+}
+
+fn read(path: &str) -> Result<Vec<u8>, String> {
+    read_repository_file(&repo_root(), path)
+}
+
+fn descriptor(path: &str) -> Result<Descriptor, String> {
+    Ok(Descriptor {
+        path: path.into(),
+        sha256: sha256(&read(path)?),
+    })
+}
+
+fn parse<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
+    serde_json::from_slice(bytes).map_err(|error| format!("invalid coverage contract: {error}"))
+}
+
+fn digest<T: Serialize>(value: &T) -> Result<String, String> {
+    let value = serde_json::to_value(value).map_err(|error| error.to_string())?;
+    Ok(sha256(&canonical_bytes(&value)?))
+}
+
+fn string<'a>(value: &'a Value, field: &str) -> Result<&'a str, String> {
+    value[field]
+        .as_str()
+        .ok_or_else(|| format!("missing string {field}"))
+}
+
+fn array<'a>(value: &'a Value, field: &str) -> Result<&'a Vec<Value>, String> {
+    value[field]
+        .as_array()
+        .ok_or_else(|| format!("missing array {field}"))
+}
+
+fn add_row(rows: &mut BTreeMap<String, BTreeSet<String>>, id: String, candidate: Option<&str>) {
+    let candidates = rows.entry(id).or_default();
+    if let Some(candidate) = candidate {
+        candidates.insert(candidate.into());
+    }
+}
+
+fn derive_inventory() -> Result<Inventory, String> {
+    let requirements: Requirements = parse(&read(REQUIREMENTS)?)?;
+    derive_inventory_with_requirements(requirements, descriptor(REQUIREMENTS)?)
+}
+fn derive_inventory_with_requirements(
+    requirements: Requirements,
+    requirements_descriptor: Descriptor,
+) -> Result<Inventory, String> {
+    derive_inventory_with_catalog(
+        requirements,
+        requirements_descriptor,
+        descriptor("crates/excalidraw-fonts/catalog/revision-1.json")?,
+    )
+}
+
+fn derive_inventory_with_catalog(
+    requirements: Requirements,
+    requirements_descriptor: Descriptor,
+    catalog: Descriptor,
+) -> Result<Inventory, String> {
+    if requirements.schema != "excalidraw-render/coverage-requirements/v1" {
+        return Err("unexpected coverage requirements schema".into());
+    }
+    let mut seen = BTreeSet::new();
+    for requirement in &requirements.requirements {
+        if requirement.id.is_empty()
+            || !seen.insert(requirement.id.as_str())
+            || requirement.issue == 0
+            || requirement.remaining.trim().is_empty()
+        {
+            return Err("invalid or duplicate coverage requirement".into());
+        }
+        for evidence in &requirement.evidence {
+            // Evidence links describe where code existed when the requirement
+            // was recorded, not inputs to a render. Preserve them without opening
+            // today's source files: edits and moves must not invalidate
+            // execution keys.
+            if evidence.source.path.trim().is_empty()
+                || !hex(&evidence.source.sha256, 64)
+                || evidence.anchor.trim().is_empty()
+            {
+                return Err(format!(
+                    "invalid historical evidence link for {}",
+                    requirement.id
+                ));
+            }
+        }
+    }
+    // The fixed requirement set cannot shrink merely by removing a policy row.
+    let expected = [
+        "corpus.five-layers",
+        "coverage.global-ownership",
+        "fuzz.codecs",
+        "fuzz.complete-render",
+        "snapshots.public-facade",
+        "determinism.process-order",
+        "determinism.cross-target",
+        "smoke.mixed-scene",
+    ];
+    if seen != expected.into_iter().collect() {
+        return Err("coverage requirements must retain the complete requirement set".into());
+    }
+    let registry: Value = parse(&read(REGISTRY)?)?;
+    let surface: Value = parse(&read(&crate::revision::Reference::SceneSurface.path())?)?;
+    let mut sources = vec![
+        descriptor(REGISTRY)?,
+        descriptor(&crate::revision::Reference::SceneSurface.path())?,
+        requirements_descriptor,
+        catalog.clone(),
+    ];
+    let mut rows = BTreeMap::new();
+    for field in array(&surface, "fieldDispositions")? {
+        add_row(
+            &mut rows,
+            format!(
+                "surface:{}:{}",
+                string(field, "recordKind")?,
+                string(field, "path")?
+            ),
+            None,
+        );
+    }
+    let mut executions = Vec::new();
+    let mut cases = BTreeSet::new();
+    for case in array(&registry, "cases")? {
+        let id = string(case, "id")?;
+        if !cases.insert(id) {
+            return Err(format!("duplicate case {id}"));
+        }
+        let path = string(case, "path")?;
+        let manifest_path = format!("{path}/manifest.json");
+        let manifest: Value = parse(&read(&manifest_path)?)?;
+        let manifest_descriptor = descriptor(&manifest_path)?;
+        sources.push(manifest_descriptor.clone());
+        let scene_path = format!("{path}/{}", string(&manifest["scene"], "path")?);
+        let scene = descriptor(&scene_path)?;
+        if scene.sha256 != string(&manifest["scene"], "sha256")? {
+            return Err(format!("stale scene for {id}"));
+        }
+        let profile = if case["kind"] == "frame" {
+            &manifest["profile"]
+        } else {
+            &manifest["reference"]["profile"]
+        };
+        let profile = descriptor(string(profile, "path")?)?;
+        sources.push(profile.clone());
+        if let Some(coverage) = manifest["coverage"].as_array() {
+            for row in coverage {
+                add_row(
+                    &mut rows,
+                    format!("case-label:{}", string(row, "identity")?),
+                    Some(id),
+                );
+            }
+        }
+        let mut append = |variant: &str,
+                          export: ExportTarget,
+                          options: &Value,
+                          formats: &Value|
+         -> Result<(), String> {
+            let input_digest = digest(&json!({"manifest":manifest_descriptor,"scene":scene,
+                "profile":profile,"catalog":catalog,"options":options,"export":export}))?;
+            for (format, name) in [
+                (Format::Svg, "svg"),
+                (Format::Png, "png"),
+                (Format::Pdf, "pdf"),
+            ] {
+                let reference_artifact = if formats[name]["artifact"].is_object() {
+                    let artifact = descriptor(&format!(
+                        "{path}/{}",
+                        string(&formats[name]["artifact"], "path")?
+                    ))?;
+                    if artifact.sha256 != string(&formats[name]["artifact"], "sha256")? {
+                        return Err(format!(
+                            "stale reference artifact for {id}/{variant}/{name}"
+                        ));
+                    }
+                    Some(artifact)
+                } else {
+                    None
+                };
+                executions.push(Execution {
+                    key: CaseKey {
+                        case: id.into(),
+                        variant: variant.into(),
+                        export: export.clone(),
+                        format,
+                        inputs_sha256: input_digest.clone(),
+                    },
+                    options: options.clone(),
+                    reference_artifact,
+                });
+            }
+            Ok(())
+        };
+        if case["kind"] == "frame" {
+            for target in array(&manifest, "targets")? {
+                let ordinal = target["frame_ordinal"]
+                    .as_u64()
+                    .filter(|n| *n > 0)
+                    .ok_or("invalid frame ordinal")?;
+                append(
+                    "default",
+                    ExportTarget::Frame { ordinal },
+                    &manifest["options"],
+                    &target["outputs"],
+                )?;
+            }
+        } else {
+            for variant in array(&manifest, "variants")? {
+                append(
+                    string(variant, "id")?,
+                    ExportTarget::Scene {},
+                    &variant["options"],
+                    &variant["formats"],
+                )?;
+            }
+        }
+    }
+    executions.sort_by(|a, b| a.key.cmp(&b.key));
+    if executions.windows(2).any(|pair| pair[0].key == pair[1].key) {
+        return Err("duplicate execution key".into());
+    }
+    sources.sort_by(|a, b| a.path.cmp(&b.path));
+    sources.dedup();
+    Ok(Inventory {
+        schema: INVENTORY_SCHEMA.into(),
+        compatibility_revision: 1,
+        scope: "draft-registered-cases-and-surface-fields".into(),
+        sources,
+        coverage: rows
+            .into_iter()
+            .map(|(id, candidates)| CoverageRow {
+                id,
+                candidates: candidates.into_iter().collect(),
+            })
+            .collect(),
+        executions,
+        requirements: requirements.requirements,
+    })
+}
+
+pub fn inventory_json() -> Result<String, String> {
+    serde_json::to_string_pretty(&derive_inventory()?).map_err(|error| error.to_string())
+}
+
+pub fn inventory_digest() -> Result<String, String> {
+    digest(&load_inventory()?)
+}
+
+fn load_inventory() -> Result<Inventory, String> {
+    let inventory: Inventory = parse(&read(INVENTORY)?)?;
+    if inventory != derive_inventory()? {
+        return Err(
+            "stale coverage inventory; regenerate with conformance inventory and review the diff"
+                .into(),
+        );
+    }
+    Ok(inventory)
+}
+
+pub fn verify_inventory() -> Result<(), String> {
+    let inventory = load_inventory()?;
+    for id in crate::conformance::case_ids()? {
+        crate::conformance::verify(&id)?;
+    }
+    println!("verified coverage inventory: {} coverage rows, {} executions, {} open requirements; release closure is pending",
+        inventory.coverage.len(), inventory.executions.len(), inventory.requirements.len());
+    Ok(())
+}
+
+pub fn verify_closure() -> Result<(), String> {
+    ownership::verify_closed()
+        .map_err(|error| format!("release coverage is incomplete: {error}"))?;
+    let inventory = load_inventory()?;
+    Err(format!(
+        "release coverage is incomplete; unresolved: {}",
+        inventory
+            .requirements
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+fn hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn historical_evidence_links_do_not_gate_execution_inventory() {
+        let stored: Inventory = parse(&read(INVENTORY).unwrap()).unwrap();
+        let mut requirements: Requirements = parse(&read(REQUIREMENTS).unwrap()).unwrap();
+        // Model a linked implementation that has changed, and another whose
+        // old path/anchor disappeared in a refactor. Neither is a render input.
+        requirements.requirements[0].evidence[0].source.sha256 = "0".repeat(64);
+        requirements.requirements[1].evidence[0].source.path =
+            "xtask/src/retired-evidence-location.rs".into();
+        requirements.requirements[1].evidence[0].anchor = "fn retired_name()".into();
+        let derived = derive_inventory_with_requirements(
+            requirements.clone(),
+            descriptor(REQUIREMENTS).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(derived.executions, stored.executions);
+        assert_eq!(derived.coverage, stored.coverage);
+        assert_eq!(derived.requirements, requirements.requirements);
+        // Ordinary generation still reproduces the checked-in record exactly.
+        assert_eq!(derive_inventory().unwrap(), stored);
+    }
+}

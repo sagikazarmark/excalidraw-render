@@ -1,0 +1,443 @@
+use std::fs;
+
+use crate::common::pdf_inspect::{declares_base_font, pdf_actual_text, pdf_text};
+use crate::common::raster::decode_png;
+use crate::common::render::{render, render_with_request, trailing_work_charges};
+use crate::common::reports::assert_report_matches;
+use crate::common::repository_root;
+use crate::common::svg::{font_family_attribute, EXCALIFONT_FAMILIES};
+use excalidraw_render::{
+    DiagnosticCode, OutputFormat, RenderOutcome, RenderRequest, Renderer, ResourceLimits,
+    SceneDocument,
+};
+use excalidraw_render_compare::{compare, CanonicalRgba8, ComparisonMode, VisualClass};
+use serde_json::Value;
+
+/// The text of the focused scene: two lines, eighteen scalars.
+const FOCUSED_TEXT: &str = "One two three\nFour";
+
+#[test]
+fn excalifont_text_renders_semantically_in_every_format() {
+    let scene = focused_scene();
+
+    for format in [OutputFormat::Svg, OutputFormat::Png, OutputFormat::Pdf] {
+        let first = render(&scene, format);
+        assert!(first.report().diagnostics().is_empty());
+
+        // The golden record holds every format's bytes
+        // (`facade.excalifont-text.v1`); this test holds what they mean.
+        match format {
+            OutputFormat::Svg => {
+                let svg = std::str::from_utf8(first.artifact().bytes()).expect("SVG is UTF-8");
+                assert!(svg.contains("@font-face{font-family:'Excalifont'"));
+                assert!(svg.contains("data:font/woff2;base64,"));
+                assert!(
+                    svg.contains("font.excalifont.ofl-1.1")
+                        || svg.contains("Excalifont and Virgil provenance is retained together")
+                );
+                assert!(svg.contains(&format!(
+                    "{} font-size=\"20\" text-anchor=\"middle\"",
+                    font_family_attribute(EXCALIFONT_FAMILIES)
+                )));
+                assert_eq!(svg.matches("<text data-source-text=").count(), 1);
+                assert_eq!(svg.matches("<tspan ").count(), 2);
+                let first_text = svg
+                    .split("<tspan x=\"")
+                    .nth(1)
+                    .expect("text line is emitted");
+                let line_x = first_text
+                    .split('"')
+                    .next()
+                    .expect("text has a line anchor");
+                let line_y = first_text
+                    .split(" y=\"")
+                    .nth(1)
+                    .and_then(|value| value.split('"').next())
+                    .expect("text has a line baseline");
+                assert_eq!(line_x, "45");
+                assert_eq!(line_y.split_whitespace().count(), 1);
+                // Lines are adjacent tspans with nothing between them: under
+                // xml:space="preserve" any separator is a rendered character,
+                // and a trailing space would shift a middle- or end-anchored
+                // line. The line break lives in data-source-text.
+                assert!(svg.contains(">One two three</tspan><tspan"));
+                assert!(svg.contains(">Four</tspan></text>"));
+                assert_eq!(svg_source_text(svg), FOCUSED_TEXT);
+                assert!(!svg.contains("Unavailable: text"));
+            }
+            OutputFormat::Png => {
+                let png = decode_png(first.artifact().bytes());
+                assert_eq!((png.width, png.height), (118, 102));
+                assert!(png.rgba.as_chunks::<4>().0.iter().any(|pixel| {
+                    pixel[2] > pixel[0] && pixel[2] > pixel[1] && pixel[3] == 255
+                }));
+                // Spec §8.5 per-glyph device phases: an independent pinned
+                // Chromium replay of this rotated scene measured 0 changed
+                // pixels, SSIM bits 3feffa5b1c4f155c, against the golden PNG.
+            }
+            OutputFormat::Pdf => {
+                let pdf = pdf_text(first.artifact().bytes());
+                assert!(pdf.contains("/Subtype /Type0"));
+                assert!(declares_base_font(&pdf, "Excalifont"));
+                assert!(pdf.contains("/ToUnicode "));
+                assert!(pdf.contains("/FontFile2 "));
+                // Krilla's character codes are the subset's glyph IDs
+                // (ADR-0021).
+                assert!(pdf.contains("/CIDToGIDMap /Identity"));
+                assert!(pdf.contains("<0001> <004F>"));
+                assert!(pdf.contains(
+                    "/ActualText <FEFF004F006E0065002000740077006F002000740068007200650065000A>"
+                ));
+                assert!(pdf.contains("/ActualText <FEFF0046006F00750072>"));
+                assert_eq!(pdf_actual_text(&pdf), FOCUSED_TEXT);
+                assert!(!pdf.contains("Unavailable: text"));
+                assert!(pdf.contains("Excalifont and Virgil provenance is retained together"));
+                assert!(pdf.contains("license.ofl-1.1"));
+            }
+            _ => panic!("the test covers the revision-1 format set"),
+        }
+    }
+}
+
+#[test]
+fn approved_excalifont_text_passes_the_direct_png_typography_budget() {
+    let case = repository_root().join("tests/conformance/cases/focused/excalifont-text");
+    let scene_bytes = fs::read(case.join("scene.excalidraw")).expect("approved scene is present");
+    let scene = SceneDocument::parse(&scene_bytes).expect("approved scene is admitted");
+    let outcome = render(&scene, OutputFormat::Png);
+
+    assert_report_matches(
+        outcome.report(),
+        &case.join("expected-report.json"),
+        "approved Excalifont text PNG",
+    );
+    let candidate = decode_png(outcome.artifact().bytes()).into_canonical();
+    let reference = CanonicalRgba8::new(
+        110,
+        92,
+        fs::read(case.join("evidence/official-png.rgba"))
+            .expect("approved direct-canvas evidence is present"),
+    )
+    .expect("approved evidence is canonical RGBA8");
+    let report = compare(
+        &reference,
+        &candidate,
+        VisualClass::Typography,
+        &[],
+        ComparisonMode::Canonical,
+    )
+    .expect("candidate and reference dimensions agree");
+    assert!(
+        report.passed(),
+        "typography budget failed: changed_pixels={}, ssim={:?}",
+        report.whole.changed_pixels,
+        report.whole.ssim
+    );
+}
+
+#[test]
+fn excalifont_text_limits_recover_at_exact_scalar_and_shaping_work_boundaries() {
+    let scene = focused_scene();
+    let unconstrained = render(&scene, OutputFormat::Svg);
+    let scalars = u32::try_from(FOCUSED_TEXT.chars().count()).expect("scalar count fits u32");
+
+    let accepted_limits = ResourceLimits::builder()
+        .max_text_scalars_per_element(scalars)
+        .max_total_text_scalars(u64::from(scalars))
+        .build()
+        .expect("text scalar equality is valid");
+    let accepted = render_svg_with_limits(&scene, accepted_limits);
+    assert!(accepted.report().is_empty());
+    assert_eq!(
+        accepted.artifact().bytes(),
+        unconstrained.artifact().bytes()
+    );
+
+    let crossing_limits = ResourceLimits::builder()
+        .max_text_scalars_per_element(scalars - 1)
+        .build()
+        .expect("text scalar crossing profile is valid");
+    let crossing = render_svg_with_limits(&scene, crossing_limits);
+    let diagnostic = crossing
+        .report()
+        .diagnostics()
+        .iter()
+        .find(|diagnostic| {
+            diagnostic.code() == DiagnosticCode::RESOURCE_ELEMENT_COMPLEXITY_REPLACED
+        })
+        .expect("the local text crossing diagnostic is retained");
+    assert_eq!(
+        diagnostic.code(),
+        DiagnosticCode::RESOURCE_ELEMENT_COMPLEXITY_REPLACED
+    );
+    assert_eq!(diagnostic.element_id(), Some("text"));
+    assert_eq!(diagnostic.json_pointer(), "/elements/0");
+    assert_eq!(
+        serde_json::to_value(diagnostic).expect("diagnostic serializes"),
+        serde_json::json!({
+            "code":"resource.element-complexity-replaced",
+            "severity":"warning",
+            "format":"svg",
+            "effects":["visual", "semantic"],
+            "element_id":"text",
+            "json_pointer":"/elements/0",
+            "message":"text was omitted because it exceeds its scalar limit",
+            "details":{
+                "kind":"resource_limit",
+                "field":"max_text_scalars_per_element",
+                "configured":scalars - 1,
+                "measurement":{"kind":"attempted","value":scalars},
+                "value_kind":"count",
+                "recovery":"placeholder"
+            }
+        })
+    );
+    let crossing_svg = std::str::from_utf8(crossing.artifact().bytes()).expect("SVG is UTF-8");
+    assert!(crossing_svg.contains("fill=\"#f1f3f5\""));
+    assert!(!crossing_svg.contains("font-family=\"Excalifont\""));
+    assert!(!crossing_svg.contains("@font-face{font-family:'Excalifont'"));
+
+    let aggregate_request = RenderRequest::builder(OutputFormat::Svg)
+        .resource_limits(
+            ResourceLimits::builder()
+                .max_text_scalars_per_element(scalars - 1)
+                .max_total_text_scalars(u64::from(scalars - 1))
+                .build()
+                .expect("aggregate text crossing limits are valid"),
+        )
+        .build()
+        .expect("aggregate text crossing request is valid");
+    let aggregate = Renderer::new()
+        .render(&scene, &aggregate_request)
+        .expect_err("aggregate text crossing is fatal before shaping");
+    assert_eq!(
+        aggregate.code(),
+        excalidraw_render::ErrorCode::RESOURCE_TOTAL_TEXT_EXCEEDED
+    );
+    assert!(aggregate.report().is_empty());
+
+    let shaping_work = element_work_boundary(&scene, OutputFormat::Svg);
+    let work_equality = render_svg_with_limits(
+        &scene,
+        ResourceLimits::builder()
+            .max_element_work_units(shaping_work)
+            .build()
+            .expect("work equality profile is valid"),
+    );
+    assert!(work_equality.report().is_empty());
+    assert_eq!(
+        work_equality.artifact().bytes(),
+        unconstrained.artifact().bytes()
+    );
+    let work_crossing = render_svg_with_limits(
+        &scene,
+        ResourceLimits::builder()
+            .max_element_work_units(shaping_work - 1)
+            .build()
+            .expect("work crossing profile is valid"),
+    );
+    let descriptor =
+        work_crossing_descriptor(&work_crossing).expect("the shaping-work diagnostic is retained");
+    assert_eq!(descriptor["details"]["configured"], shaping_work - 1);
+    assert_eq!(descriptor["details"]["measurement"]["value"], shaping_work);
+    assert_eq!(descriptor["details"]["value_kind"], "work_units");
+}
+
+#[test]
+fn basic_latin_svg_leaves_line_shaping_and_alignment_to_the_viewer() {
+    for (alignment, anchor_x, text_anchor) in [
+        ("left", "0", "start"),
+        ("center", "50", "middle"),
+        ("right", "100", "end"),
+    ] {
+        let source = format!(
+            "{{\"type\":\"excalidraw\",\"version\":2,\"elements\":[{{\"id\":\"text\",\"type\":\"text\",\"width\":100,\"height\":30,\"fontSize\":20,\"fontFamily\":5,\"text\":\"office\",\"textAlign\":\"{alignment}\",\"updated\":1}}],\"appState\":{{}},\"files\":{{}}}}"
+        );
+        let scene = SceneDocument::parse(source.as_bytes()).expect("text scene is admitted");
+        let outcome = render_svg_with_limits(&scene, ResourceLimits::default());
+        assert!(outcome.report().is_empty());
+        let svg = std::str::from_utf8(outcome.artifact().bytes()).expect("SVG is UTF-8");
+        let first_text = svg.split("<tspan x=\"").nth(1).expect("text is emitted");
+        let line_x = first_text.split('"').next().expect("line x terminates");
+        let line_y = first_text
+            .split(" y=\"")
+            .nth(1)
+            .and_then(|value| value.split('"').next())
+            .expect("line y terminates");
+
+        assert_eq!(line_x, anchor_x);
+        assert_eq!(line_y.split_whitespace().count(), 1);
+        assert!(svg.contains(&format!("text-anchor=\"{text_anchor}\"")));
+        assert!(svg.contains(">office</tspan>"));
+        assert_eq!(svg_source_text(svg), "office");
+    }
+}
+
+#[test]
+fn png_text_coverage_uses_the_transformed_glyph_rectangle() {
+    let scene = focused_scene();
+    let unconstrained = render(&scene, OutputFormat::Png);
+    // PNG charges the glyph coverage raster to total work only, so the
+    // element work boundary is the shaping work every format shares.
+    let shaping_work = element_work_boundary(&scene, OutputFormat::Png);
+    assert_eq!(
+        shaping_work,
+        element_work_boundary(&scene, OutputFormat::Svg)
+    );
+
+    let equality = render_with_work_limit(&scene, OutputFormat::Png, shaping_work);
+    assert!(equality.report().is_empty());
+    assert_eq!(
+        equality.artifact().bytes(),
+        unconstrained.artifact().bytes()
+    );
+
+    // The coverage is the text's own total-work event, followed only by the
+    // canvas-wide encoding events, at 16 samples per pixel of the rotated
+    // glyph rectangle rather than of the whole surface.
+    let charges = trailing_work_charges(&scene, || RenderRequest::builder(OutputFormat::Png), 3);
+    let coverage = &charges[2];
+    assert_eq!(coverage.element_id.as_deref(), Some("text"));
+    assert_eq!(coverage.json_pointer, "/elements/0");
+    assert_eq!(coverage.units % 16, 0);
+    let decoded = decode_png(unconstrained.artifact().bytes());
+    assert_eq!((decoded.width, decoded.height), (118, 102));
+    assert!(
+        (1..118 * 102).contains(&(coverage.units / 16)),
+        "coverage must not charge the 118x102 full surface: {coverage:?}"
+    );
+}
+
+#[test]
+fn pdf_maps_the_same_glyph_id_to_distinct_unicode_character_codes() {
+    // A space and a no-break space are one glyph. Krilla gives a glyph one
+    // character code and one ToUnicode entry, so the second text it stands
+    // for travels in its own `/ActualText` span inside the line's (ADR-0021).
+    let scene = text_scene(" \u{a0}", 40.0, 30.0);
+    let outcome = render(&scene, OutputFormat::Pdf);
+    let pdf = pdf_text(outcome.artifact().bytes());
+    assert!(pdf.contains("<0001> <0020>"));
+    assert!(!pdf.contains("<00A0>\n"));
+    assert_eq!(
+        crate::common::pdf_inspect::shown_codes(&crate::common::pdf_inspect::page_content(
+            outcome.artifact().bytes()
+        )),
+        [1, 1]
+    );
+    assert!(pdf.contains("/ActualText <FEFF002000A0> >> BDC\n"));
+    assert!(pdf.contains("/Span << /ActualText <FEFF00A0> >> BDC\n"));
+}
+
+/// The focused scene: one Excalifont text of two centred lines, rotated and
+/// translucent. The golden record holds its bytes in every format
+/// (`facade.excalifont-text.v1`).
+const FOCUSED_SCENE: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/conformance/golden/facade-scenes/excalifont-text.excalidraw"
+));
+
+/// The focused scene, admitted.
+fn focused_scene() -> SceneDocument {
+    SceneDocument::parse(FOCUSED_SCENE).expect("focused text scene is admitted")
+}
+
+fn text_scene(text: &str, width: f64, height: f64) -> SceneDocument {
+    let source = format!(
+        "{{\"type\":\"excalidraw\",\"version\":2,\"elements\":[{{\"id\":\"text\",\"type\":\"text\",\"width\":{width},\"height\":{height},\"fontSize\":20,\"fontFamily\":5,\"text\":{},\"updated\":1}}],\"appState\":{{}},\"files\":{{}}}}",
+        serde_json::to_string(text).expect("test text serializes")
+    );
+    SceneDocument::parse(source.as_bytes()).expect("text scene is admitted")
+}
+
+fn render_svg_with_limits(scene: &SceneDocument, limits: ResourceLimits) -> RenderOutcome {
+    let request = RenderRequest::builder(OutputFormat::Svg)
+        .resource_limits(limits)
+        .build()
+        .expect("SVG request is valid");
+    render_with_request(scene, &request)
+}
+
+fn render_with_work_limit(
+    scene: &SceneDocument,
+    format: OutputFormat,
+    max_element_work_units: u64,
+) -> RenderOutcome {
+    let request = RenderRequest::builder(format)
+        .resource_limits(
+            ResourceLimits::builder()
+                .max_element_work_units(max_element_work_units)
+                .build()
+                .expect("element work limit is valid"),
+        )
+        .build()
+        .expect("work-limited request is valid");
+    render_with_request(scene, &request)
+}
+
+/// More probes than the pipeline has stages that meter element work (shared
+/// resolution and projection; PNG raster samples go to total work only), so a
+/// probe that keeps crossing is a metering change rather than a slow
+/// convergence.
+const WORK_PROBE_LIMIT: usize = 8;
+
+/// The text element's semantic work for `format`: the smallest
+/// `max_element_work_units` at which it renders without a work crossing. Each
+/// stage that meters element work refuses the whole attempt and reports it, so
+/// a probe that starts at one unit and adopts each refused attempt as its next
+/// limit settles on the boundary in as many renders as there are stages; the
+/// tests then hold the ±1 boundary against that value instead of a literal.
+fn element_work_boundary(scene: &SceneDocument, format: OutputFormat) -> u64 {
+    let mut limit = 1;
+    for _ in 0..WORK_PROBE_LIMIT {
+        let outcome = render_with_work_limit(scene, format, limit);
+        let Some(descriptor) = work_crossing_descriptor(&outcome) else {
+            return limit;
+        };
+        let attempted = descriptor["details"]["measurement"]["value"]
+            .as_u64()
+            .expect("work attempt is an integer");
+        assert!(
+            attempted > limit,
+            "a work crossing at {limit} reports a larger attempt, not {attempted}"
+        );
+        limit = attempted;
+    }
+    panic!("{format:?} element work did not settle within {WORK_PROBE_LIMIT} probes");
+}
+
+/// The descriptor of the text element's work crossing, if the render raised
+/// one; several stages may refuse, in which case the largest attempt is the one
+/// the next probe must clear.
+fn work_crossing_descriptor(outcome: &RenderOutcome) -> Option<Value> {
+    outcome
+        .report()
+        .diagnostics()
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.code() == DiagnosticCode::RESOURCE_ELEMENT_WORK_EXCEEDED
+                && diagnostic.element_id() == Some("text")
+        })
+        .map(|diagnostic| serde_json::to_value(diagnostic).expect("work diagnostic serializes"))
+        .max_by_key(|descriptor| descriptor["details"]["measurement"]["value"].as_u64())
+}
+
+fn svg_source_text(svg: &str) -> String {
+    let mut source = String::new();
+    for tail in svg.split("data-source-text=\"").skip(1) {
+        let value = tail
+            .split('"')
+            .next()
+            .expect("source annotation terminates");
+        source.push_str(
+            &value
+                .replace("&#10;", "\n")
+                .replace("&#13;", "\r")
+                .replace("&#9;", "\t")
+                .replace("&quot;", "\"")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&amp;", "&"),
+        );
+    }
+    source
+}

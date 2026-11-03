@@ -1,0 +1,17 @@
+{
+  "schema": "excalidraw-render/representative-case-registry/v1",
+  "cases": [
+    {
+      "case_id": "representative.excali-local-slides.v1",
+      "path": "tests/conformance/cases/representative/excali-local-slides"
+    },
+    {
+      "case_id": "representative.velox-design.v2",
+      "path": "tests/conformance/cases/representative/velox-design"
+    },
+    {
+      "case_id": "representative.varmq-queue-diagram.v1",
+      "path": "tests/conformance/cases/representative/varmq-queue-diagram"
+    }
+  ]
+}

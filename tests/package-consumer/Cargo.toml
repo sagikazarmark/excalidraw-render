@@ -1,0 +1,29 @@
+[package]
+name = "excalidraw-render-package-consumer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[features]
+default = ["cjk"]
+cjk = ["excalidraw-render/cjk"]
+
+# `cjk` is the consumer's own feature so `check-no-cjk.sh` can turn it off;
+# the facade renders every format, so PNG and PDF stay on in both builds.
+[dependencies]
+excalidraw-render = { path = "../../target/package/excalidraw-render-0.1.0", version = "=0.1.0", default-features = false, features = ["png", "pdf"] }
+
+[dev-dependencies]
+base64 = "=0.23.1"
+serde_json = "=1.0.154"
+sha2 = "=0.11.1"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "=0.3.79"
+
+[patch.crates-io]
+excalidraw-render-fonts = { path = "../../target/package/excalidraw-render-fonts-0.1.0+excalidraw.0.18.1" }
+excalidraw-render-fonts-xiaolai = { path = "../../target/package/excalidraw-render-fonts-xiaolai-0.1.0+excalidraw.0.18.1" }
+excalidraw-render-fonts-xiaolai-extended = { path = "../../target/package/excalidraw-render-fonts-xiaolai-extended-0.1.0+excalidraw.0.18.1" }
+
+[workspace]

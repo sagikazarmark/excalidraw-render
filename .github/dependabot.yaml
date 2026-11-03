@@ -1,0 +1,71 @@
+version: 2
+
+updates:
+  # A lock update can change artifact bytes, so each one runs every gate and is
+  # adopted through review (see the pinning policy in Cargo.toml). The crates
+  # whose code computes artifact bytes (decoders, shaping, subsetting,
+  # rasterization, the PDF writer, compression, number formatting) form their
+  # own group: it moves the golden record and the parity pins, so the release
+  # runbook (docs/development/releasing.md) merges it only between minor
+  # releases, in one restage. The rest moves
+  # weekly.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      output-bytes:
+        patterns:
+          - "krilla"
+          - "harfrust"
+          - "usvg"
+          - "resvg"
+          - "tiny-skia"
+          - "tiny-skia-path"
+          - "skera"
+          - "wuff"
+          - "ttf2woff2"
+          - "write-fonts"
+          - "read-fonts"
+          - "skrifa"
+          - "fontdb"
+          - "zune-jpeg"
+          - "png"
+          - "gif"
+          - "image-webp"
+          - "moxcms"
+          - "miniz_oxide"
+          - "brotli*"
+          - "libm"
+          - "ryu-js"
+          - "unicode-bidi"
+          - "unicode-normalization"
+      cargo:
+        patterns:
+          - "*"
+
+  # The reference profile binds the oracle's npm lock and the bundle built from
+  # it (renderer spec 3.2), so a change is a reviewed profile change, never an
+  # automatic one. The ignore also covers security updates: the oracle builds
+  # once and renders committed fixtures with the network off.
+  - package-ecosystem: npm
+    directory: /tools/reference-oracle
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: "*"
+
+  # dist generates release.yml from dist-workspace.toml, whose
+  # `github-action-commits` pins its actions, and `dist plan` fails the
+  # workflow when the file differs from what dist generates. An update there
+  # goes through `dist generate`, not Dependabot.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: daily
+    exclude-paths:
+      - .github/workflows/release.yml
+    groups:
+      github-actions:
+        patterns:
+          - "*"

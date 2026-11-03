@@ -1,0 +1,33 @@
+[package]
+name = "excalidraw-render-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Command-line tool that renders Excalidraw drawings to SVG, PNG and PDF, without a browser"
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["excalidraw", "cli", "svg", "png", "pdf"]
+categories = ["command-line-utilities", "graphics"]
+include = ["/src/", "/LICENSE-BUNDLE.txt", "/README.md"]
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "excalidraw-render"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+excalidraw-render.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+unicode-normalization.workspace = true
+unicase.workspace = true
+
+[dev-dependencies]
+tiny-skia.workspace = true

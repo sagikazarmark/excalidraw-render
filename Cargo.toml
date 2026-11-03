@@ -1,0 +1,183 @@
+[workspace]
+members = [
+    "crates/excalidraw-render",
+    "crates/excalidraw-fonts",
+    "crates/excalidraw-fonts-xiaolai",
+    "crates/excalidraw-fonts-xiaolai-extended",
+    "crates/excalidraw-render-cli",
+    "crates/excalidraw-render-compare",
+    "xtask",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sagikazarmark/excalidraw-render"
+# The oldest compiler the published crates support; `just msrv` compiles the
+# renderer and CLI with it. Krilla 0.8.2 declares 1.92.
+# The gates and the release binaries build with the toolchain
+# `rust-toolchain.toml` pins.
+rust-version = "1.92"
+
+[workspace.dependencies]
+# Pinning policy. The renderer's requirements are caret ranges: a published
+# library's exact requirements bind every application that depends on it, and
+# Cargo holds one version per semver-compatible range, so an `=` pin on a crate
+# the ecosystem shares (png, gif, libm, miniz_oxide, tiny-skia, ...) makes the
+# renderer unresolvable beside any crate that needs a later patch. Crates whose
+# code computes artifact bytes (decoders, shaping, subsetting, rasterization,
+# PDF writing, compression, number formatting) can change output in a patch
+# release, so this repository's `Cargo.lock` fixes every version its gates
+# test, and a bump is adopted deliberately by updating the lock. Applications
+# that need the exact bytes of a release commit their lockfile. Host-only and
+# binary-only pins (CLI, xtask, dev) bind nothing downstream and stay exact.
+# Krilla 0.8.2 requires `^0.22.1`, so 0.22 stays in the lock as a second copy
+# (#208, #209) until a Krilla release accepts 0.23.
+base64 = { version = "0.23.1", default-features = false, features = ["alloc"] }
+clap = { version = "=4.6.7", features = ["derive", "wrap_help"] }
+excalidraw-render = { path = "crates/excalidraw-render", version = "=0.1.0" }
+# The font packages publish as `excalidraw-render-fonts*`; the keys keep the
+# shorter names the code and the generated catalog use.
+excalidraw-fonts = { package = "excalidraw-render-fonts", path = "crates/excalidraw-fonts", version = "=0.1.0", default-features = false }
+excalidraw-fonts-xiaolai = { package = "excalidraw-render-fonts-xiaolai", path = "crates/excalidraw-fonts-xiaolai", version = "=0.1.0" }
+excalidraw-fonts-xiaolai-extended = { package = "excalidraw-render-fonts-xiaolai-extended", path = "crates/excalidraw-fonts-xiaolai-extended", version = "=0.1.0" }
+csscolorparser = "0.9.0"
+cssparser = "0.38.0"
+cssparser-color = "0.6.0"
+crc32fast = "1.5.2"
+gif = { version = "0.14.2", default-features = false, features = ["std"] }
+image-webp = "0.2.4"
+# Turns on serde_json's `float_roundtrip` in every build that includes xtask or
+# the comparator's tests. The renderer parses scene numbers itself, and xtask's
+# `arbitrary_precision` keeps each `Value` number's source token, so only typed
+# float deserialization would see the correctly rounded parse; nothing here does.
+jsonschema = { version = "=0.60.2", default-features = false }
+# The PDF writer (ADR-0021). A Krilla bump is a byte-affecting change for every
+# PDF, as svg2pdf's was, so the lock moves it deliberately. Krilla shapes nothing (every glyph
+# arrives positioned). `raster-images` only compiles its image module: every
+# image arrives as sample planes, so Krilla decodes nothing, and the
+# `zune-jpeg` default features it enables are the ones `resvg`'s
+# `raster-images` already enables. krilla-svg is ported as
+# `render/pdf/svg_draw.rs` instead of depended on, because its `tiny-skia` and
+# `resvg` default features would reach the PNG rasterizer.
+krilla = { version = "0.8.2", default-features = false, features = ["raster-images"] }
+# Rendering math calls every transcendental function through this crate
+# (`crates/excalidraw-render/src/portable_math.rs`, ADR-0007) so that both
+# supported targets compute the same doubles. It is already in the lock through
+# `num-traits`; the direct edge adds no package.
+libm = "0.2.16"
+# The IDAT compressor (ADR-0004). 0.9.1 emits the same level-6 stream as 0.8.9:
+# every PNG digest held across the move. png 0.18.1 requires `^0.8`, so 0.8.9
+# stays in the lock as a second copy until png moves to 0.9 (#208).
+miniz_oxide = "0.9.1"
+moxcms = { version = "0.9.1", default-features = false }
+png = "0.18.1"
+jpeg-encoder = "=0.7.1"
+resvg = { version = "0.49.0", default-features = false, features = ["raster-images"] }
+roxmltree = "0.21.2"
+regex = "=1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+# Formats floats through zmij: positive exponents are signed (`1e+20`), the
+# spelling spec 11.1 requires (#211). Only the CLI and tests serialize JSON;
+# the renderer's dependency on it is test-only.
+serde_json = "=1.0.154"
+simplecss = "0.2.2"
+sha1 = "=0.11.0"
+sha2 = "0.11.0"
+# The upstream malformed-name fix replaces the safety adapter. 0.9.0 serializes
+# a subset's GSUB and GPOS lists in declaration order rather than reversed, so
+# their offsets and every WOFF2 move; the subset profile token names it
+# (ADR-0003).
+skera = { version = "0.9.0", default-features = false }
+# Shaping (#202). Its font is read-fonts 0.46's, which the renderer also
+# measures, maps and outlines with (`shaping.rs`).
+harfrust = { version = "0.15.0", default-features = false, features = ["std"] }
+ryu-js = { version = "1.0.3", default-features = false }
+unicode-bidi = "0.3.18"
+unicode-normalization = "=0.1.26"
+unicase = "=2.10.0"
+svgtypes = "0.16.1"
+# Host-only: CLI delivery staging and xtask scratch directories. Never a
+# renderer dependency, so random temporary names cannot reach output bytes.
+tempfile = "=3.27.0"
+# Host-only: xtask signals a capture wrapper's process group through the
+# syscall, since slim images ship no `kill` executable. Already in the lock
+# through tempfile; `process` adds no package.
+rustix = { version = "=1.1.6", features = ["process"] }
+tiny-skia = { version = "0.12.0", default-features = false, features = ["png-format", "std"] }
+# `default-features = false` drops upstream's `cli` feature (and `clap`);
+# `portable-float` passes through to `brotli/portable-float`, which is what keeps
+# quality-11 WOFF2 bytes identical between native and wasm32 (ADR-0003). The
+# subset profile token in `excalidraw-fonts` names this version; 0.14 stopped
+# transforming glyf/loca by default, which the encode stage asks for explicitly.
+ttf2woff2 = { version = "0.14.1", default-features = false, features = ["portable-float"] }
+usvg = { version = "0.49.0", default-features = false, features = ["text"] }
+wuff = { version = "0.2.9", default-features = false, features = ["brotli"] }
+# `write_fonts::read` is the workspace's only font parser: read-fonts 0.46,
+# the version skera plans over and HarfRust shapes with. Metrics, character
+# maps, outlines, name handling and the typed layout validator (ADR-0020) read
+# through it, so the workspace has no direct read-fonts dependency.
+write-fonts = { version = "0.55.0", default-features = false, features = ["read", "tables"] }
+zune-jpeg = { version = "0.5.15", default-features = false, features = ["std"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Clippy 1.98 suggests `as_chunks` for constant-size `chunks_exact`. Every
+# site is in bytes that evidence pins by digest (the canonical comparator's
+# sources, bound by its profile, and the PNG test helpers the image contracts
+# hash), so rewriting them would re-pin that evidence for no change in
+# behavior. Clippy 1.97 does not know the lint and warns once per crate;
+# `unknown_lints` ignores `-D warnings`, so that warning does not fail it.
+chunks_exact_to_as_chunks = "allow"
+
+[profile.release]
+codegen-units = 1
+lto = true
+panic = "abort"
+strip = true
+
+# dist's release workflow builds the shipped binaries with this profile. It is
+# `release` unchanged: dist's default thin LTO would ship a binary built
+# differently from the one the release checks run.
+[profile.dist]
+inherits = "release"
+
+# `cargo test` builds with this profile. It keeps the `dev` semantics the suite
+# relies on for diagnosis — debug assertions, overflow checks, unwinding,
+# debuginfo for backtraces — and only turns codegen optimization on: brotli
+# quality 11, WOFF2 decoding, SSIM, resvg rasterization and large-JSON parsing
+# dominate the push gate and run an order of magnitude slower unoptimized.
+# `profile.release` is deliberately not reused for tests: its single codegen
+# unit and fat LTO slow every compile, and `strip` removes backtraces.
+[profile.test]
+opt-level = 2
+
+# `cargo run -p xtask -- catalog verify` decodes all 230 official font chunks
+# and the `conformance verify-*` commands digest large evidence files, so the
+# `dev` profile optimizes dependencies too. Workspace members are excluded, which
+# keeps the edit-compile loop on the renderer itself fast. `test` inherits this
+# override, so `cargo run` and `cargo test` share the compiled external
+# dependencies and differ only in the workspace members' own opt-level.
+[profile.dev.package."*"]
+opt-level = 2
+
+# cargo-release (docs/development/releasing.md). Every crate moves in lockstep
+# and the release is one signed `vX.Y.Z` tag, which dist's release workflow
+# builds and publishes the binaries from. The font crates keep their
+# `+excalidraw.X.Y.Z` build metadata across a bump (`metadata = "persistent"`
+# in their manifests); xtask and the comparator are bumped but not published.
+# No `shared-version = true`: the crates that inherit `version.workspace` are
+# already one shared-version group, and the flag would put the font crates,
+# whose versions are their own, in a second one, which leaves `{{version}}`
+# unrendered in the consolidated commit message.
+[workspace.metadata.release]
+consolidate-commits = true
+allow-branch = ["main"]
+pre-release-commit-message = "release {{version}}"
+tag-name = "v{{version}}"
+tag-message = "excalidraw-render {{version}}"
+sign-tag = true

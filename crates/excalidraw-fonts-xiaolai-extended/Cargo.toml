@@ -1,0 +1,21 @@
+[package]
+name = "excalidraw-render-fonts-xiaolai-extended"
+version = "0.1.0+excalidraw.0.18.1"
+edition.workspace = true
+rust-version.workspace = true
+description = "Xiaolai CJK font chunks (extended blocks) for excalidraw-render (internal)"
+# The crate's code is MIT OR Apache-2.0; the Xiaolai font chunks are OFL-1.1.
+# LICENSE-BUNDLE.txt carries every license and notice.
+license = "(MIT OR Apache-2.0) AND OFL-1.1"
+repository.workspace = true
+readme = "README.md"
+keywords = ["excalidraw", "fonts", "cjk"]
+categories = ["graphics"]
+include = ["/src/", "/fonts/", "/LICENSE-BUNDLE.txt", "/README.md"]
+
+[lints]
+workspace = true
+
+# cargo-release keeps the Excalidraw build metadata when it bumps the version.
+[package.metadata.release]
+metadata = "persistent"

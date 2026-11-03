@@ -1,0 +1,870 @@
+use std::fs;
+use std::path::{Component, Path};
+
+use serde_json::{json, Value};
+
+use crate::conformance::{canonical_bytes, object, repo_root, sha256};
+use crate::viewer_identity::{is_commit, runtime_record, ReferenceRuntime};
+
+mod runtime;
+pub use runtime::refresh as refresh_pdfium_runtime;
+
+const MANIFEST_PATH: &str =
+    "tests/conformance/pdf-viewer-qualification/rectangle-outline/manifest.json";
+const MANIFEST_DIGEST_PATH: &str =
+    "tests/conformance/pdf-viewer-qualification/rectangle-outline/manifest.sha256";
+const QUALIFICATION_SCHEMA_ID: &str = "excalidraw-render/conformance-pdf-viewer-qualification/v1";
+const VIEWER_PROFILE_SCHEMA_ID: &str = "excalidraw-render/conformance-pdf-viewer-profile/v1";
+const STRUCTURE_PROFILE_SCHEMA_ID: &str = "excalidraw-render/conformance-pdf-structure-profile/v1";
+pub(crate) const COMPARATOR_DIGEST: &str =
+    "4cb3f236ce675abb9ba566365322c9602f20a40e8a42c196df8a02be3a677588";
+const REFERENCE_RASTER_DIGEST: &str =
+    "5ab7b28c0d733b93198a0c456e1683f5d130c310831f1593ccc3e6c0c2ba8d8a";
+const VISUAL_FAIL_RASTER_DIGEST: &str =
+    "67aee623b8731045330343370de0dfd30fdbb7a343bf2043d1f36473e4b9b88f";
+
+// These producer identities describe the historical Python-era capture.
+// Rust replay checks the same retained bytes with the current adapter.
+// Other viewer adapters, parser locks, schemas, comparator and evidence stay
+// live; the PDF.js harness is historical producer code (ADR-0019).
+const HISTORICAL_QUALIFICATION_SOURCES: &[&str] = &[
+    "tools/pdf-viewer-qualification.sh",
+    "tools/pdf-harness/generate-fixtures.py",
+    "xtask/src/pdf_viewers.rs",
+    "tools/pdf-harness/pdfium/test_alpha.py",
+];
+const HISTORICAL_STRUCTURE_SOURCES: &[&str] = &[
+    "tools/pdf-harness/structure/inspect.py",
+    "tools/pdf-harness/run-structure.sh",
+    "tools/pdf-harness/generate-fixtures.py",
+    "tools/pdf-harness/install.sh",
+];
+const HISTORICAL_PDFIUM_SOURCES: &[&str] = &[
+    "tools/pdf-harness/run-pdfium.sh",
+    "tools/pdf-harness/install.sh",
+    "tools/pdf-harness/pdfium/render.py",
+    "tools/pdf-harness/pdfium/test_alpha.py",
+];
+
+/// Shared with the Node collector. The declaration itself is not a producer
+/// entry. Collections taken before devenv supplied PDFium also bind
+/// [`RETIRED_NATIVE_LOCK`]; their verifiers accept that inventory too.
+pub(crate) fn rust_pdfium_sources() -> Result<Vec<String>, String> {
+    serde_json::from_str(include_str!(
+        "../../tools/pdf-harness/pdfium-rust/sources.json"
+    ))
+    .map_err(|error| format!("invalid Rust PDFium source inventory: {error}"))
+}
+
+/// The pin file the Rust worker's library identity lived in before devenv
+/// supplied PDFium (ADR-0024). Earlier Rust collections still name it.
+pub(crate) const RETIRED_NATIVE_LOCK: &str = "tools/pdf-harness/pdfium-native.lock.json";
+
+/// Whether a receipt's `library_sha256` is a library identity: the lowercase
+/// SHA-256 of whichever pdfium-binaries library ran. Each host's build has its
+/// own; rendered bytes, not this digest, decide whether a run qualifies.
+pub(crate) fn is_library_sha256(value: &Value) -> bool {
+    value.as_str().is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+pub fn verify() -> Result<(), String> {
+    runtime::verify()?;
+    let manifest_bytes = fs::read(repo_root().join(MANIFEST_PATH))
+        .map_err(|error| format!("failed to read {MANIFEST_PATH}: {error}"))?;
+    let manifest: Value = serde_json::from_slice(&manifest_bytes)
+        .map_err(|error| format!("invalid PDF qualification manifest: {error}"))?;
+    let canonical_manifest = canonical_bytes(&manifest)?;
+    if manifest_bytes != [&canonical_manifest[..], b"\n"].concat() {
+        return Err("PDF qualification manifest is not canonical JSON plus LF".to_owned());
+    }
+    verify_sidecar(MANIFEST_DIGEST_PATH, &canonical_manifest)?;
+    verify_declared_schema(&manifest, QUALIFICATION_SCHEMA_ID)?;
+    if manifest["id"] != json!("pdf-viewers.rectangle-outline.v1")
+        || manifest["originating_issue"]
+            != json!("https://github.com/sagikazarmark/excalidraw-render.orig/issues/35")
+        || manifest["case"]["id"] != json!("focused.rectangle-outline.v1")
+        || manifest["case"]["control"]["renderer_evidence"] != json!(false)
+        || manifest["case"]["control"]["vector_only"] != json!(true)
+    {
+        return Err("PDF qualification identity is invalid".to_owned());
+    }
+
+    verify_visual_authority(&manifest["case"]["visual_authority"])?;
+    verify_fixture(
+        &manifest["case"]["fixtures"]["valid"],
+        "candidate-control.pdf",
+    )?;
+    verify_fixture(
+        &manifest["case"]["fixtures"]["visual_fail"],
+        "visual-fail-structure-pass.pdf",
+    )?;
+    verify_fixture(
+        &manifest["case"]["fixtures"]["structure_fail"],
+        "visual-pass-structure-fail.pdf",
+    )?;
+    verify_fixture(
+        &manifest["case"]["fixtures"]["parser_warning"],
+        "parser-warning.pdf",
+    )?;
+    verify_fixture(
+        &manifest["case"]["fixtures"]["coverage"],
+        "structure-coverage.pdf",
+    )?;
+    verify_fixture(
+        &manifest["case"]["fixtures"]["active_action"],
+        "active-action.pdf",
+    )?;
+    verify_expectation(&manifest["case"]["expected_structures"]["calibration"])?;
+    verify_expectation(&manifest["case"]["expected_structures"]["visual_fail"])?;
+    verify_expectation(&manifest["case"]["expected_structures"]["coverage"])?;
+
+    verify_descriptor(&manifest["comparator"])?;
+    if manifest["comparator"]["sha256"] != json!(COMPARATOR_DIGEST) {
+        return Err("PDF qualification does not use the approved comparator".to_owned());
+    }
+    verify_producer_sources(
+        &manifest["implementation"],
+        HISTORICAL_QUALIFICATION_SOURCES,
+    )?;
+    verify_viewer_profile(&manifest["profiles"]["pdfium"], "pdfium")?;
+    verify_viewer_profile(&manifest["profiles"]["pdfjs"], "pdfjs")?;
+    verify_structure_profile(&manifest["profiles"]["structure"])?;
+
+    verify_viewer_output(&manifest["outputs"]["pdfium"], "pdfium")?;
+    verify_viewer_output(&manifest["outputs"]["pdfjs"], "pdfjs")?;
+    verify_structure_output(&manifest["structures"]["valid"], true, &[])?;
+    verify_structure_output(&manifest["structures"]["visual_fail"], true, &[])?;
+    verify_structure_output(
+        &manifest["structures"]["structure_fail"],
+        false,
+        &[
+            "form-count",
+            "image-count",
+            "image-inventory",
+            "structural-inventory-sha256",
+        ],
+    )?;
+    verify_structure_output(
+        &manifest["structures"]["parser_warning"],
+        false,
+        &["parser-warnings"],
+    )?;
+    verify_structure_output(&manifest["structures"]["coverage"], true, &[])?;
+    verify_structure_output(
+        &manifest["structures"]["active_action"],
+        false,
+        &[
+            "structural-inventory-sha256",
+            "action-kinds",
+            "prohibited-actions",
+        ],
+    )?;
+    if manifest["determinism"]
+        != json!({
+            "fresh_processes": true,
+            "resolution_dpi": 96,
+            "samples_per_role": 2,
+            "shared_parser_state": false,
+            "shared_viewer_state": false,
+        })
+    {
+        return Err("PDF harness determinism record is invalid".to_owned());
+    }
+
+    Ok(())
+}
+
+fn verify_visual_authority(descriptor: &Value) -> Result<(), String> {
+    let bytes = verify_raster_descriptor(descriptor)?;
+    if descriptor["path"]
+        != json!("tests/conformance/svg-viewer-qualification/rectangle-outline/evidence/chromium-reference.rgba")
+        || descriptor["sha256"] != json!(REFERENCE_RASTER_DIGEST)
+        || sha256(&bytes) != REFERENCE_RASTER_DIGEST
+    {
+        return Err("PDF visual authority is not canonical Chromium official SVG".to_owned());
+    }
+    Ok(())
+}
+
+fn verify_fixture(descriptor: &Value, filename: &str) -> Result<(), String> {
+    let bytes = verify_descriptor(descriptor)?;
+    let expected_path =
+        format!("tests/conformance/pdf-viewer-qualification/rectangle-outline/{filename}");
+    if descriptor["path"] != json!(expected_path)
+        || descriptor["byte_length"] != json!(bytes.len())
+        || !bytes.starts_with(b"%PDF-1.7\n")
+    {
+        return Err(format!("invalid PDF qualification fixture {filename}"));
+    }
+    Ok(())
+}
+
+fn verify_expectation(descriptor: &Value) -> Result<(), String> {
+    let bytes = verify_descriptor(descriptor)?;
+    let expectation: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid PDF structure expectation: {error}"))?;
+    validate_against(
+        "tests/conformance/pdf-structure-expectation-v1.schema.json",
+        &expectation,
+    )?;
+    if expectation["schema"] != json!("excalidraw-render/pdf-structure-expectation/v1")
+        || expectation["pdf_version"] != json!("1.7")
+        || expectation["media_box"] != json!([0, 0, 150, 90])
+        || expectation["crop_box"] != json!([0, 0, 150, 90])
+        || expectation["output_intent_count"] != json!(1)
+    {
+        return Err("PDF structure expectation is invalid".to_owned());
+    }
+    Ok(())
+}
+
+fn verify_viewer_profile(descriptor: &Value, viewer: &str) -> Result<(), String> {
+    let bytes = verify_descriptor(descriptor)?;
+    let path = string(&descriptor["path"], "viewer profile path")?;
+    verify_sidecar(&path.replace(".json", ".sha256"), &bytes)?;
+    let profile: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid {viewer} PDF viewer profile: {error}"))?;
+    verify_declared_schema(&profile, VIEWER_PROFILE_SCHEMA_ID)?;
+    if profile["identity"]["reference_profile_digest"]
+        != json!(crate::revision::Reference::Profile.prefixed_digest()?)
+        || profile["qualification"]["case_id"] != json!("focused.rectangle-outline.v1")
+        || profile["qualification"]["dpi"] != json!(96)
+        || profile["settings"]["dimensions"]["dpi"] != json!("96")
+        || profile["settings"]["resources"]["network"]
+            .as_str()
+            .is_none_or(|value| !value.contains("none"))
+    {
+        return Err(format!("{viewer} PDF viewer profile identity is invalid"));
+    }
+    if viewer == "pdfium" {
+        // The approved profile names the retired Python-era lock; the Rust
+        // adapter's runtime is verified on its own (ADR-0019).
+        crate::conformance_candidate_gate::historical_binding(
+            &profile["implementation"]["lockfile"],
+        )?;
+    }
+    if viewer == "pdfium" {
+        verify_producer_sources(
+            &profile["implementation"]["sources"],
+            HISTORICAL_PDFIUM_SOURCES,
+        )?;
+    } else {
+        verify_producer_sources(
+            &profile["implementation"]["sources"],
+            &["tools/pdf-harness/install.sh"],
+        )?;
+    }
+    match viewer {
+        "pdfium" => {
+            // The Python-era runtime records (`pypdfium2`, `python`,
+            // `platform`) describe the historical capture and are checked for
+            // presence; the version the Rust worker replays is the profile's,
+            // which `pdfium-runtime.json` must match (`runtime::verify`).
+            let version = string(&profile["identity"]["upstream_version"], "PDFium version")?;
+            if profile["id"] != json!("canonical-pdf.pdfium.v1")
+                || profile["identity"]["viewer"] != json!("pdfium")
+                || version.is_empty()
+                || !runtime_record(&profile, "pdfium")?.starts_with(&format!("{version} "))
+            {
+                return Err("canonical PDFium profile settings are invalid".to_owned());
+            }
+            for historical in ["pypdfium2", "python", "platform"] {
+                runtime_record(&profile, historical)?;
+            }
+            verify_exact_directory("tools/pdf-harness/pdfium/empty-fonts", &[".keep"])?;
+        }
+        "pdfjs" => {
+            verify_pdfjs_profile(&profile, &ReferenceRuntime::load()?)?;
+            verify_pdfjs_install(&profile)?;
+        }
+        _ => return Err(format!("unknown PDF viewer {viewer}")),
+    }
+    Ok(())
+}
+
+/// The PDF.js profile's identity is self-consistent and its container, Node
+/// and npm are the reference container's, which it runs in.
+fn verify_pdfjs_profile(profile: &Value, reference: &ReferenceRuntime) -> Result<(), String> {
+    let version = string(&profile["identity"]["upstream_version"], "PDF.js version")?;
+    let commit = &profile["identity"]["upstream_commit"];
+    if profile["id"] != json!("canonical-pdf.pdfjs.v1")
+        || profile["identity"]["viewer"] != json!("pdfjs")
+        || version.is_empty()
+        || !is_commit(commit)
+        || runtime_record(profile, "pdfjs-dist")?
+            != format!("{version} at {}", commit.as_str().unwrap_or_default())
+        || runtime_record(profile, "@napi-rs/canvas")?.is_empty()
+    {
+        return Err("canonical PDF.js profile settings are invalid".to_owned());
+    }
+    for (name, expected) in [
+        ("node", reference.node.clone()),
+        ("npm", reference.npm.clone()),
+        (
+            "container",
+            format!("{}, {}", reference.container, reference.architecture),
+        ),
+    ] {
+        let recorded = runtime_record(profile, name)?;
+        if recorded != expected {
+            return Err(format!(
+                "PDF.js profile records {name} {recorded}, the reference profile {expected}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+const PDFJS_PACKAGE: &str = "tools/pdf-harness/pdfjs/package.json";
+const PDFJS_LOCK: &str = "tools/pdf-harness/pdfjs/package-lock.json";
+
+/// The PDF.js the harness installs is the one the profile names: the profile
+/// binds the harness's npm lockfile by digest, live, so a Dependabot bump of
+/// PDF.js is a visible viewer change, and the lockfile and `package.json`
+/// install the profile's `pdfjs-dist` and `@napi-rs/canvas` versions. The
+/// harness's other sources are producer code (ADR-0019); evidence captured
+/// under an earlier lock records it historically.
+fn verify_pdfjs_install(profile: &Value) -> Result<(), String> {
+    let descriptor = &profile["implementation"]["lockfile"];
+    let path = string(&descriptor["path"], "PDF.js lockfile path")?;
+    if path != PDFJS_LOCK {
+        return Err(format!("the PDF.js profile binds {path}, not {PDFJS_LOCK}"));
+    }
+    let lock_bytes = read_repository_file(&repo_root(), path)?;
+    if descriptor["sha256"] != json!(sha256(&lock_bytes)) {
+        return Err(format!(
+            "{path} is not the lockfile the PDF.js profile qualified; requalify the viewer"
+        ));
+    }
+    let lock: Value =
+        serde_json::from_slice(&lock_bytes).map_err(|error| format!("invalid {path}: {error}"))?;
+    let package: Value =
+        serde_json::from_slice(&read_repository_file(&repo_root(), PDFJS_PACKAGE)?)
+            .map_err(|error| format!("invalid {PDFJS_PACKAGE}: {error}"))?;
+    let version = string(&profile["identity"]["upstream_version"], "PDF.js version")?;
+    let canvas = runtime_record(profile, "@napi-rs/canvas")?;
+    for (name, expected) in [("pdfjs-dist", version), ("@napi-rs/canvas", canvas)] {
+        let locked = lock["packages"][format!("node_modules/{name}")]["version"]
+            .as_str()
+            .unwrap_or_default();
+        let declared = package["dependencies"][name].as_str().unwrap_or_default();
+        if locked.is_empty()
+            || declared != locked
+            || !(expected == locked || expected.starts_with(&format!("{locked} ")))
+        {
+            return Err(format!(
+                "the PDF.js harness installs {name} {locked:?} (package.json {declared:?}), \
+                 the profile names {expected:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The qpdf structure profile's identity is its lockfile's package, which is
+/// bound to the profile by digest.
+fn verify_qpdf_identity(profile: &Value, lock: &Value) -> Result<(), String> {
+    let version = &lock["package"]["version"];
+    let commit = &lock["package"]["commit"];
+    if lock["package"]["name"] != json!("qpdf")
+        || !version.as_str().is_some_and(|version| !version.is_empty())
+        || !is_commit(commit)
+        || profile["identity"]["upstream_version"] != *version
+        || profile["identity"]["upstream_commit"] != *commit
+        || runtime_record(profile, "qpdf")?
+            != format!(
+                "{} at {}",
+                version.as_str().unwrap_or_default(),
+                commit.as_str().unwrap_or_default()
+            )
+    {
+        return Err("qpdf structure profile does not name its locked qpdf".to_owned());
+    }
+    Ok(())
+}
+
+fn verify_structure_profile(descriptor: &Value) -> Result<(), String> {
+    let bytes = verify_descriptor(descriptor)?;
+    let path = string(&descriptor["path"], "structure profile path")?;
+    verify_sidecar(&path.replace(".json", ".sha256"), &bytes)?;
+    let profile: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid PDF structure profile: {error}"))?;
+    verify_declared_schema(&profile, STRUCTURE_PROFILE_SCHEMA_ID)?;
+    if profile["id"] != json!("canonical-pdf-structure.qpdf.v1")
+        || profile["identity"]["parser"] != json!("qpdf")
+        || profile["identity"]["reference_profile_digest"]
+            != json!(crate::revision::Reference::Profile.prefixed_digest()?)
+        || profile["qualification"]["case_id"] != json!("focused.rectangle-outline.v1")
+        || runtime_record(&profile, "python")?.is_empty()
+    {
+        return Err("canonical PDF structure profile identity is invalid".to_owned());
+    }
+    let lock = verify_descriptor(&profile["implementation"]["lockfile"])?;
+    verify_qpdf_identity(
+        &profile,
+        &serde_json::from_slice(&lock).map_err(|error| format!("invalid qpdf lock: {error}"))?,
+    )?;
+    verify_producer_sources(
+        &profile["implementation"]["sources"],
+        HISTORICAL_STRUCTURE_SOURCES,
+    )?;
+    verify_descriptor(&profile["qualification"]["report_schema"])?;
+    verify_descriptor(&profile["qualification"]["expectation_schema"])?;
+    Ok(())
+}
+
+fn verify_viewer_output(output: &Value, viewer: &str) -> Result<(), String> {
+    verify_visual_control(
+        &output["valid"],
+        viewer,
+        "valid",
+        true,
+        REFERENCE_RASTER_DIGEST,
+    )?;
+    verify_visual_control(
+        &output["visual_fail"],
+        viewer,
+        "visual-fail",
+        false,
+        VISUAL_FAIL_RASTER_DIGEST,
+    )?;
+    verify_visual_control(
+        &output["structure_fail"],
+        viewer,
+        "structure-fail",
+        true,
+        REFERENCE_RASTER_DIGEST,
+    )?;
+    Ok(())
+}
+
+fn verify_visual_control(
+    control: &Value,
+    viewer: &str,
+    role: &str,
+    expected_pass: bool,
+    expected_hash: &str,
+) -> Result<(), String> {
+    verify_raster_descriptor(&control["raster"])?;
+    if control["expected_pass"] != json!(expected_pass)
+        || control["raster"]["sha256"] != json!(expected_hash)
+        || control["run_sha256"] != json!([expected_hash, expected_hash])
+    {
+        return Err(format!("invalid {viewer} {role} raster outcome"));
+    }
+    let report = verify_descriptor(&control["comparison"])?;
+    let expected_report = match role {
+        "valid" | "structure-fail" => format!(
+            "{{\"changed_pixels\":0,\"height\":120,\"mode\":\"{viewer}\",\"passed\":true,\"ssim_bits\":\"3ff0000000000000\",\"width\":200}}\n"
+        ),
+        "visual-fail" => format!(
+            "{{\"changed_pixels\":1600,\"height\":120,\"mode\":\"{viewer}\",\"passed\":false,\"ssim_bits\":\"3fed276f3bda86aa\",\"width\":200}}\n"
+        ),
+        _ => return Err(format!("unknown visual role {role}")),
+    };
+    if report != expected_report.as_bytes() {
+        return Err(format!("invalid {viewer} {role} comparator report"));
+    }
+    Ok(())
+}
+
+fn verify_structure_output(
+    output: &Value,
+    expected_pass: bool,
+    expected_failures: &[&str],
+) -> Result<(), String> {
+    let bytes = verify_descriptor(&output["report"])?;
+    let report: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid PDF structure report: {error}"))?;
+    validate_against(
+        "tests/conformance/pdf-structure-report-v1.schema.json",
+        &report,
+    )?;
+    let failures: Vec<_> = array(&report["checks"], "structure checks")?
+        .iter()
+        .filter(|check| check["passed"] == json!(false))
+        .map(|check| check["id"].clone())
+        .collect();
+    let expected: Vec<_> = expected_failures
+        .iter()
+        .map(|failure| json!(failure))
+        .collect();
+    let hash = output["report"]["sha256"].clone();
+    if output["expected_pass"] != json!(expected_pass)
+        || report["passed"] != json!(expected_pass)
+        || report["expected_pass"] != json!(expected_pass)
+        || output["failure_checks"] != Value::Array(expected.clone())
+        || failures != expected
+        || output["run_sha256"] != json!([hash, hash])
+    {
+        return Err("PDF structural gate outcome is invalid".to_owned());
+    }
+    if report["document"]["output_intents"]
+        .as_array()
+        .is_none_or(|values| values.len() != 1)
+        || report["pages"]
+            .as_array()
+            .is_none_or(|values| values.len() != 1)
+    {
+        return Err("PDF structural report omits required document data".to_owned());
+    }
+    let page = &report["pages"][0];
+    for field in [
+        "annotations",
+        "clips",
+        "fonts",
+        "forms",
+        "images",
+        "mappings",
+        "masks",
+        "operations",
+        "text_operations",
+        "transparency",
+        "vector_operations",
+    ] {
+        if !page[field].is_array() {
+            return Err(format!("PDF structural report omits {field}"));
+        }
+    }
+    if expected_failures
+        == [
+            "form-count",
+            "image-count",
+            "image-inventory",
+            "structural-inventory-sha256",
+        ]
+        && page["images"][0]["classification"] != json!("undeclared")
+    {
+        return Err("structural failure does not identify undeclared image".to_owned());
+    }
+    if expected_failures == ["parser-warnings"]
+        && report["parser"]["warnings"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+    {
+        return Err("parser warning control does not retain warnings".to_owned());
+    }
+    if expected_failures.contains(&"prohibited-actions")
+        && report["document"]["actions"]
+            .as_array()
+            .is_none_or(|actions| {
+                actions.len() != 1
+                    || actions[0]["classification"] != json!("prohibited")
+                    || actions[0]["kind"] != json!("/JavaScript")
+            })
+    {
+        return Err("active-action control does not retain the prohibited action".to_owned());
+    }
+    if output["report"]["path"]
+        == json!("tests/conformance/pdf-viewer-qualification/rectangle-outline/evidence/coverage-structure.json")
+    {
+        if page["fonts"].as_array().is_none_or(|values| values.len() != 1)
+            || page["fonts"][0]["embedded"] != json!(true)
+            || page["fonts"][0]["to_unicode_sha256"].is_null()
+            || page["forms"].as_array().is_none_or(|values| values.len() != 2)
+            || page["mappings"]
+                .as_array()
+                .is_none_or(|values| values.len() != 2)
+            || page["annotations"][0]["action"]["kind"] != json!("/URI")
+            || page["clips"].as_array().is_none_or(|values| values.len() != 1)
+            || page["masks"].as_array().is_none_or(|values| values.len() != 2)
+            || page["transparency"]
+                .as_array()
+                .is_none_or(|values| values.len() != 1)
+            || page["images"].as_array().is_none_or(|values| values.len() != 2)
+            || page["images"][0]["classification"] != json!("source")
+            || page["images"][1]["classification"] != json!("source")
+            || page["images"][1]["resource"]
+                != json!("page/CoverageForm/SourceImage/SMask")
+            || page["images"][1]["data_sha256"]
+                != json!("76be8b528d0075f7aae98d6fa57a6d3c83ae480a8469e668d7b0af968995ac71")
+            || report["document"]["xmp"].is_null()
+            || report["document"]["attachments"]["scene.excalidraw"].is_null()
+        {
+            return Err("PDF structural coverage report is incomplete".to_owned());
+        }
+        let mapping_kinds: Vec<_> = array(&page["mappings"], "font mappings")?
+            .iter()
+            .map(|mapping| mapping["kind"].clone())
+            .collect();
+        if Value::Array(mapping_kinds) != json!(["to-unicode", "actual-text"]) {
+            return Err("PDF structural coverage mappings are incomplete".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn verify_raster_descriptor(descriptor: &Value) -> Result<Vec<u8>, String> {
+    let bytes = verify_descriptor(descriptor)?;
+    if descriptor["width"] != json!(200)
+        || descriptor["height"] != json!(120)
+        || descriptor["byte_length"] != json!(96_000)
+        || descriptor["layout"] != json!("top-left-row-major")
+        || descriptor["pixel_format"] != json!("straight-alpha-srgb-rgba8")
+        || bytes.len() != 96_000
+    {
+        return Err("PDF viewer raster descriptor is invalid".to_owned());
+    }
+    if bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .any(|pixel| pixel[3] == 0 && pixel[..3] != [0, 0, 0])
+    {
+        return Err("PDF viewer raster has nonzero RGB below zero alpha".to_owned());
+    }
+    Ok(bytes)
+}
+
+fn verify_declared_schema(value: &Value, expected_id: &str) -> Result<(), String> {
+    let schema = object(&value["schema"], "schema descriptor")?;
+    if schema["id"] != json!(expected_id) {
+        return Err(format!("unexpected schema identity for {expected_id}"));
+    }
+    let bytes = verify_descriptor(&value["schema"])?;
+    let definition: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid {expected_id} schema: {error}"))?;
+    validate_schema(&definition, value, expected_id)
+}
+
+fn validate_against(relative: &str, value: &Value) -> Result<(), String> {
+    let bytes = fs::read(repo_root().join(relative))
+        .map_err(|error| format!("failed to read {relative}: {error}"))?;
+    let definition: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid schema {relative}: {error}"))?;
+    validate_schema(&definition, value, relative)
+}
+
+fn validate_schema(definition: &Value, value: &Value, subject: &str) -> Result<(), String> {
+    jsonschema::draft202012::meta::validate(definition)
+        .map_err(|error| format!("{subject} schema fails its meta-schema: {error}"))?;
+    jsonschema::draft202012::options()
+        .should_validate_formats(true)
+        .build(&crate::conformance::schema_without_approval_gate(
+            definition,
+        ))
+        .map_err(|error| format!("failed to compile {subject} schema: {error}"))?
+        .validate(value)
+        .map_err(|error| format!("document fails {subject}: {error}"))
+}
+
+fn verify_producer_sources(sources: &Value, historical: &[&str]) -> Result<(), String> {
+    crate::conformance_candidate_gate::require_historical_sources(sources, historical)?;
+    for source in array(sources, "producer sources")? {
+        let path = string(&source["path"], "producer source path")?;
+        if !historical.contains(&path) {
+            verify_descriptor(source)?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_descriptor(descriptor: &Value) -> Result<Vec<u8>, String> {
+    let descriptor = object(descriptor, "file descriptor")?;
+    let relative = string(&descriptor["path"], "file descriptor path")?;
+    let bytes = read_repository_file(&repo_root(), relative)?;
+    if descriptor["sha256"] != json!(sha256(&bytes))
+        && !crate::conformance_candidate_gate::historical_producer(relative)
+    {
+        return Err(format!("stale digest for {relative}"));
+    }
+    Ok(bytes)
+}
+
+fn read_repository_file(root: &Path, relative: &str) -> Result<Vec<u8>, String> {
+    let path = Path::new(relative);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(format!("unsafe repository-relative path {relative:?}"));
+    }
+    let root = fs::canonicalize(root)
+        .map_err(|error| format!("failed to resolve repository root: {error}"))?;
+    let resolved = fs::canonicalize(root.join(path))
+        .map_err(|error| format!("failed to resolve {relative}: {error}"))?;
+    if !resolved.starts_with(&root) {
+        return Err(format!(
+            "file descriptor path escapes repository: {relative}"
+        ));
+    }
+    fs::read(resolved).map_err(|error| format!("failed to read {relative}: {error}"))
+}
+
+fn verify_sidecar(relative: &str, bytes: &[u8]) -> Result<(), String> {
+    let expected = fs::read_to_string(repo_root().join(relative))
+        .map_err(|error| format!("failed to read {relative}: {error}"))?;
+    if expected != format!("{}\n", sha256(bytes)) {
+        return Err(format!("stale digest sidecar {relative}"));
+    }
+    Ok(())
+}
+
+fn verify_exact_directory(relative: &str, expected: &[&str]) -> Result<(), String> {
+    let path = repo_root().join(relative);
+    if path.is_symlink() {
+        return Err(format!(
+            "profile directory must not be a symlink: {relative}"
+        ));
+    }
+    let mut entries = fs::read_dir(&path)
+        .map_err(|error| format!("failed to read profile directory {relative}: {error}"))?
+        .map(|entry| {
+            let entry =
+                entry.map_err(|error| format!("failed to read entry under {relative}: {error}"))?;
+            if entry.path().is_symlink() {
+                return Err(format!("profile directory contains a symlink: {relative}"));
+            }
+            entry
+                .file_name()
+                .into_string()
+                .map_err(|_| format!("profile directory contains a non-UTF-8 entry: {relative}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.sort();
+    if entries != expected {
+        return Err(format!(
+            "profile directory has undeclared entries: {relative}"
+        ));
+    }
+    Ok(())
+}
+
+fn array<'a>(value: &'a Value, subject: &str) -> Result<&'a [Value], String> {
+    value
+        .as_array()
+        .map(Vec::as_slice)
+        .ok_or_else(|| format!("{subject} must be an array"))
+}
+
+fn string<'a>(value: &'a Value, subject: &str) -> Result<&'a str, String> {
+    value
+        .as_str()
+        .ok_or_else(|| format!("{subject} must be a string"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile(path: &str) -> Value {
+        serde_json::from_slice(&fs::read(repo_root().join(path)).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn pdfjs_profile_runs_in_the_reference_container_and_names_itself_consistently() {
+        let pdfjs = profile("tests/conformance/viewer-profiles/canonical-pdf-pdfjs-v1.json");
+        let reference = ReferenceRuntime::load().unwrap();
+        verify_pdfjs_profile(&pdfjs, &reference).unwrap();
+
+        let mut node = reference.clone();
+        node.node = "99.0.0".to_owned();
+        let error = verify_pdfjs_profile(&pdfjs, &node).unwrap_err();
+        assert!(
+            error.contains("node") && error.contains("99.0.0"),
+            "{error}"
+        );
+
+        let mut renamed = pdfjs.clone();
+        renamed["identity"]["upstream_version"] = json!("0.0.1");
+        assert!(verify_pdfjs_profile(&renamed, &reference).is_err());
+    }
+
+    #[test]
+    fn pdfjs_profile_binds_the_installed_pdfjs_live() {
+        let pdfjs = profile("tests/conformance/viewer-profiles/canonical-pdf-pdfjs-v1.json");
+        verify_pdfjs_install(&pdfjs).unwrap();
+
+        // A Dependabot bump moves the lockfile, which the profile no longer
+        // matches until the viewer is requalified.
+        let mut bumped = pdfjs.clone();
+        bumped["implementation"]["lockfile"]["sha256"] = json!("0".repeat(64));
+        assert!(verify_pdfjs_install(&bumped)
+            .unwrap_err()
+            .contains("requalify the viewer"));
+        // And a profile naming another PDF.js than the one installed fails.
+        let mut renamed = pdfjs.clone();
+        renamed["identity"]["upstream_version"] = json!("6.1.200");
+        assert!(verify_pdfjs_install(&renamed)
+            .unwrap_err()
+            .contains("pdfjs-dist"));
+        // And only the harness's own lockfile can stand for it.
+        let mut copied = pdfjs.clone();
+        copied["implementation"]["lockfile"]["path"] =
+            json!("tools/reference-oracle/package-lock.json");
+        assert!(verify_pdfjs_install(&copied)
+            .unwrap_err()
+            .contains("not tools/pdf-harness/pdfjs/package-lock.json"));
+    }
+
+    #[test]
+    fn qpdf_profile_names_its_locked_qpdf() {
+        let structure =
+            profile("tests/conformance/structure-profiles/canonical-pdf-structure-v1.json");
+        let lock = profile("tools/pdf-harness/structure/qpdf.lock.json");
+        verify_qpdf_identity(&structure, &lock).unwrap();
+
+        let mut bumped = lock.clone();
+        bumped["package"]["version"] = json!("13.0.0");
+        assert!(verify_qpdf_identity(&structure, &bumped).is_err());
+        let mut recommitted = lock;
+        recommitted["package"]["commit"] = json!("0".repeat(40));
+        assert!(verify_qpdf_identity(&structure, &recommitted).is_err());
+    }
+
+    #[test]
+    fn historical_producers_require_valid_membership_without_acceptance_hashes() {
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(repo_root().join(MANIFEST_PATH)).unwrap()).unwrap();
+        let mut changed = manifest.clone();
+        let sources = changed["implementation"].as_array_mut().unwrap();
+        let source = sources
+            .iter_mut()
+            .find(|s| s["path"] == "tools/pdf-harness/generate-fixtures.py")
+            .unwrap();
+        source["sha256"] = json!("a".repeat(64));
+        verify_producer_sources(&changed["implementation"], HISTORICAL_QUALIFICATION_SOURCES)
+            .unwrap();
+
+        for mutation in 0..5 {
+            let mut sources = manifest["implementation"].clone();
+            let rows = sources.as_array_mut().unwrap();
+            let index = rows
+                .iter()
+                .position(|s| s["path"] == "tools/pdf-harness/generate-fixtures.py")
+                .unwrap();
+            match mutation {
+                0 => rows[index]["sha256"] = json!("not-a-digest"),
+                1 => rows[index]["path"] = json!("../generate-fixtures.py"),
+                2 => {
+                    rows.remove(index);
+                }
+                3 => rows.push(rows[index].clone()),
+                _ => rows[index]["byte_length"] = json!(-1),
+            }
+            assert!(
+                verify_producer_sources(&sources, HISTORICAL_QUALIFICATION_SOURCES).is_err(),
+                "mutation {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn producer_exceptions_do_not_relax_parser_or_comparator_hashes() {
+        for path in [
+            "tools/pdf-harness/structure/qpdf.lock.json",
+            "crates/excalidraw-render-compare/examples/compare_pdf_rgba.rs",
+        ] {
+            let sources = json!([{"path": path, "sha256": "a".repeat(64)}]);
+            assert!(verify_producer_sources(&sources, &[])
+                .unwrap_err()
+                .contains("stale digest"));
+        }
+    }
+}

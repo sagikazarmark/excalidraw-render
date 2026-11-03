@@ -1,0 +1,246 @@
+use crate::common::pdf_inspect::pdf_text;
+use excalidraw_render::{
+    DiagnosticCode, ErrorCode, OutputFormat, RenderRequest, Renderer, ResourceLimits, SceneDocument,
+};
+
+use crate::common::raster::decode_png;
+use crate::common::svg::path_data;
+
+/// Every outline shape family, sharp and rounded. The golden record holds its
+/// bytes in every format (`facade.outline-shapes.v1`).
+const SCENE: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/conformance/golden/facade-scenes/outline-shapes.excalidraw"
+));
+
+#[test]
+fn admitted_outline_shape_families_render_directly_in_every_format() {
+    let scene = SceneDocument::parse(SCENE).expect("outline family scene is admitted");
+
+    for format in [OutputFormat::Svg, OutputFormat::Png, OutputFormat::Pdf] {
+        let request = RenderRequest::builder(format)
+            .build()
+            .expect("default render request is valid");
+        let outcome = Renderer::new()
+            .render(&scene, &request)
+            .expect("all outline families render");
+        // The golden record holds every format's bytes
+        // (`facade.outline-shapes.v1`).
+
+        assert!(
+            outcome.report().is_empty(),
+            "direct outline rendering must not use compatibility fallbacks for {format:?}: {:?}",
+            outcome.report().diagnostics()
+        );
+        match format {
+            OutputFormat::Svg => {
+                let svg = std::str::from_utf8(outcome.artifact().bytes()).unwrap();
+                assert_eq!(svg.matches("<path ").count(), 7);
+                assert!(!svg.contains("Unavailable:"));
+            }
+            OutputFormat::Png => {
+                assert!(decode_png(outcome.artifact().bytes())
+                    .rgba
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|pixel| *pixel != [255, 255, 255, 255]));
+            }
+            OutputFormat::Pdf => {
+                let pdf = pdf_text(outcome.artifact().bytes());
+                assert_eq!(pdf.matches("\nS\nQ\n").count(), 7);
+                assert!(!pdf.contains("Unavailable:"));
+            }
+            _ => unreachable!("the test enumerates every revision-1 output format"),
+        }
+    }
+}
+
+#[test]
+fn outline_geometry_accounting_uses_each_generated_operation_count() {
+    let scene = SceneDocument::parse(SCENE).unwrap();
+    let request = |maximum| {
+        RenderRequest::builder(OutputFormat::Svg)
+            .resource_limits(
+                ResourceLimits::builder()
+                    .max_geometry_segments_per_element(32)
+                    .max_total_geometry_segments(maximum)
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap()
+    };
+
+    // The scene's total geometry is the sum of every generated path's
+    // operations, read off the unconstrained render rather than pinned.
+    let unconstrained = Renderer::new()
+        .render(
+            &scene,
+            &RenderRequest::builder(OutputFormat::Svg).build().unwrap(),
+        )
+        .unwrap();
+    let total_operations: u64 =
+        path_data(std::str::from_utf8(unconstrained.artifact().bytes()).unwrap())
+            .iter()
+            .map(|path| path.matches(['M', 'C']).count() as u64)
+            .sum();
+
+    Renderer::new()
+        .render(&scene, &request(total_operations))
+        .expect("the exact total Rough operation count is admitted");
+    let error = Renderer::new()
+        .render(&scene, &request(total_operations - 1))
+        .expect_err("the first operation beyond the aggregate limit is rejected");
+    assert_eq!(error.code(), ErrorCode::RESOURCE_TOTAL_GEOMETRY_EXCEEDED);
+    assert_eq!(error.element_id(), Some("rounded-line"));
+
+    let local_limits = ResourceLimits::builder()
+        .max_geometry_segments_per_element(31)
+        .build()
+        .unwrap();
+    let local_request = RenderRequest::builder(OutputFormat::Svg)
+        .resource_limits(local_limits)
+        .build()
+        .unwrap();
+    let local = Renderer::new().render(&scene, &local_request).unwrap();
+    let diagnostic = local
+        .report()
+        .diagnostics()
+        .iter()
+        .find(|diagnostic| {
+            diagnostic.element_id() == Some("rounded-rectangle")
+                && diagnostic.code() == DiagnosticCode::RESOURCE_ELEMENT_COMPLEXITY_REPLACED
+        })
+        .expect("the first local operation crossing is diagnosed");
+    let descriptor = serde_json::to_value(diagnostic).unwrap();
+    assert_eq!(descriptor["details"]["configured"], 31);
+    assert_eq!(descriptor["details"]["measurement"]["value"], 32);
+}
+
+#[test]
+fn negative_linear_points_define_bounds_and_rotation_center() {
+    let scene = SceneDocument::parse(
+        br##"{
+        "type":"excalidraw","version":2,
+        "elements":[{"id":"negative-line","type":"line","x":100,"y":10,
+            "width":80,"height":40,"angle":1.5707963267948966,
+            "points":[[0,0],[-80,40]],"seed":9,"updated":1}],
+        "appState":{},"files":{}
+    }"##,
+    )
+    .unwrap();
+    let request = RenderRequest::builder(OutputFormat::Svg).build().unwrap();
+    let outcome = Renderer::new().render(&scene, &request).unwrap();
+    let svg = std::str::from_utf8(outcome.artifact().bytes()).unwrap();
+
+    assert!(
+        svg.contains("viewBox=\"0 0 60 100\""),
+        "unexpected bounds: {svg}"
+    );
+    assert!(
+        svg.contains("transform=\"translate(70 30) rotate(90 -40 20)\""),
+        "unexpected linear transform: {svg}"
+    );
+}
+
+#[test]
+fn huge_finite_pattern_generation_recovers_locally_in_every_format() {
+    let scene = SceneDocument::parse(
+        br##"{
+        "type":"excalidraw","version":2,
+        "elements":[{"id":"tall-hachure","type":"rectangle","x":0,"y":0,
+            "width":100,"height":2000,"backgroundColor":"#e03131",
+            "fillStyle":"hachure","strokeWidth":0.025,"seed":71,"updated":1}],
+        "appState":{},"files":{}
+    }"##,
+    )
+    .unwrap();
+    let limits = ResourceLimits::builder()
+        .max_element_work_units(1_000)
+        .build()
+        .unwrap();
+
+    for format in [OutputFormat::Svg, OutputFormat::Png, OutputFormat::Pdf] {
+        let request = RenderRequest::builder(format)
+            .resource_limits(limits.clone())
+            .build()
+            .unwrap();
+        let outcome = Renderer::new().render(&scene, &request).unwrap();
+        let diagnostic = outcome
+            .report()
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.code() == DiagnosticCode::RESOURCE_ELEMENT_WORK_EXCEEDED)
+            .expect("the local work crossing is diagnosed");
+        assert_eq!(diagnostic.element_id(), Some("tall-hachure"));
+    }
+}
+
+#[test]
+fn patterned_coordinate_crossing_recovers_before_generation_in_every_format() {
+    let scene = SceneDocument::parse(
+        br##"{
+        "type":"excalidraw","version":2,
+        "elements":[{"id":"wide-hachure","type":"rectangle","x":0,"y":0,
+            "width":100,"height":50,"backgroundColor":"#e03131",
+            "fillStyle":"hachure","seed":73,"updated":1}],
+        "appState":{},"files":{}
+    }"##,
+    )
+    .unwrap();
+    let limits = ResourceLimits::builder()
+        .max_coordinate_magnitude(99.0)
+        .build()
+        .unwrap();
+
+    for format in [OutputFormat::Svg, OutputFormat::Png, OutputFormat::Pdf] {
+        let request = RenderRequest::builder(format)
+            .resource_limits(limits.clone())
+            .build()
+            .unwrap();
+        let outcome = Renderer::new().render(&scene, &request).unwrap();
+        let diagnostics = outcome.report().diagnostics();
+        assert_eq!(diagnostics.len(), 1, "unexpected {format:?} report");
+        assert_eq!(
+            diagnostics[0].code(),
+            DiagnosticCode::RESOURCE_COORDINATE_RANGE_EXCEEDED
+        );
+        assert_eq!(diagnostics[0].json_pointer(), "/elements/0/width");
+    }
+}
+
+#[test]
+fn pathological_curve_subdivision_recovers_locally_in_every_format() {
+    let scene = SceneDocument::parse(
+        br##"{
+        "type":"excalidraw","version":2,
+        "elements":[{"id":"subdivision","type":"line","x":0,"y":0,
+            "width":100,"height":100,"points":[[0,0],[200,200],[-200,200],
+            [200,-200],[0,0]],"roundness":{"type":2},
+            "backgroundColor":"#e03131","fillStyle":"hachure","seed":72,"updated":1}],
+        "appState":{},"files":{}
+    }"##,
+    )
+    .unwrap();
+    let limits = ResourceLimits::builder()
+        .max_coordinate_magnitude(400.0)
+        .max_element_work_units(1_000)
+        .build()
+        .unwrap();
+
+    for format in [OutputFormat::Svg, OutputFormat::Png, OutputFormat::Pdf] {
+        let request = RenderRequest::builder(format)
+            .resource_limits(limits.clone())
+            .build()
+            .unwrap();
+        let outcome = Renderer::new().render(&scene, &request).unwrap();
+        let diagnostic = outcome
+            .report()
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.code() == DiagnosticCode::RESOURCE_ELEMENT_WORK_EXCEEDED)
+            .expect("the local work crossing is diagnosed");
+        assert_eq!(diagnostic.element_id(), Some("subdivision"));
+    }
+}

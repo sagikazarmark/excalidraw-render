@@ -1,0 +1,257 @@
+name: CI
+
+# The per-change gates: every recipe of `just ci`, run in the devenv shell on
+# ubuntu-latest (ADR-0024). A job is one gate or a few cheap ones that share a
+# build; the fast and render tiers compile once into a nextest archive that
+# four shards run. The release tier (`just release`) is the Release workflow.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    # Every step runs in the devenv shell, with the project's toolchain.
+    shell: devenv shell -- bash -e {0}
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up devenv
+        uses: sagikazarmark/setup-devenv@c36f9e57ca50ee1a6dad1a05a1a684e321f8096a # v0.3.0
+        with:
+          cachix-cache: rust-projects
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Set up Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cmd-format: devenv shell -- {0}
+
+      - name: Check formatting
+        run: just fmt
+
+      - name: Check dependencies
+        run: just deny
+
+      - name: Lint
+        run: just clippy
+
+  features:
+    name: Features
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up devenv
+        uses: sagikazarmark/setup-devenv@c36f9e57ca50ee1a6dad1a05a1a684e321f8096a # v0.3.0
+        with:
+          cachix-cache: rust-projects
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Set up Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cmd-format: devenv shell -- {0}
+
+      - name: Lint the feature matrix
+        run: just features
+
+      - name: Test the builds that leave out PNG or PDF
+        run: just test-features
+
+  msrv:
+    name: Rust 1.92
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up devenv
+        uses: sagikazarmark/setup-devenv@c36f9e57ca50ee1a6dad1a05a1a684e321f8096a # v0.3.0
+        with:
+          cachix-cache: rust-projects
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Set up Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cmd-format: devenv --option languages.rust.version:string 1.92.0 shell -- {0}
+
+      - name: Check the published crates on the MSRV
+        shell: devenv --option languages.rust.version:string 1.92.0 shell -- bash -e {0}
+        run: just msrv
+
+  # The fast and render tiers compile once into a nextest archive, which four
+  # shards run.
+  test-build:
+    name: Test (build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Backtraces keep file and line, without the full debuginfo that
+      # dominates link time and the archive size.
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up devenv
+        uses: sagikazarmark/setup-devenv@c36f9e57ca50ee1a6dad1a05a1a684e321f8096a # v0.3.0
+        with:
+          cachix-cache: rust-projects
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Set up Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cmd-format: devenv shell -- {0}
+
+      - name: Build and archive the test targets
+        run: just test-archive
+
+      - name: Upload the archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nextest-archive
+          path: target/nextest-archive.tar.zst
+          retention-days: 1
+          # The archive is already zstd-compressed.
+          compression-level: 0
+
+  test-shard:
+    name: Test (shard ${{ matrix.shard }}/4)
+    needs: test-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Some checks read files from earlier commits.
+          fetch-depth: 0
+
+      - name: Set up devenv
+        uses: sagikazarmark/setup-devenv@c36f9e57ca50ee1a6dad1a05a1a684e321f8096a # v0.3.0
+        with:
+          cachix-cache: rust-projects
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      # Some xtask tests build helper tools (the viewer font tool, the PDF
+      # harness wrappers) with Cargo.
+      - name: Set up Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard == 1 }}
+          cmd-format: devenv shell -- {0}
+
+      - name: Download the archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nextest-archive
+          path: target
+
+      - name: Run shard ${{ matrix.shard }}
+        run: just test-shard ${{ matrix.shard }}/4
+
+  # The conformance verifiers and the documentation tests share one debug
+  # build of the workspace.
+  verify:
+    name: Conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up devenv
+        uses: sagikazarmark/setup-devenv@c36f9e57ca50ee1a6dad1a05a1a684e321f8096a # v0.3.0
+        with:
+          cachix-cache: rust-projects
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Set up Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cmd-format: devenv shell -- {0}
+
+      - name: Verify the registered cases, the catalog and the viewer records
+        run: just conformance
+
+      - name: Doc tests
+        run: just test-doc
+
+  packaging:
+    name: Packaging
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up devenv
+        uses: sagikazarmark/setup-devenv@c36f9e57ca50ee1a6dad1a05a1a684e321f8096a # v0.3.0
+        with:
+          cachix-cache: rust-projects
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Set up Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cmd-format: devenv shell -- {0}
+          workspaces: |
+            . -> target
+            tests/package-consumer -> ../../target/package-consumer
+
+      - name: Check the packaged crates
+        run: just packaging
