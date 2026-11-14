@@ -202,13 +202,40 @@ fn visit_noto_emoji_runs(
     Ok(())
 }
 
+/// Visits the display text of every glyph run that a generic-family fallback
+/// face shaped (Liberation Sans for `sans-serif`, then Cascadia Code), when
+/// that face is not already the element's own family. The runs record which
+/// face each scalar took, so the fallback's subset covers what its `<tspan>`s
+/// show; the element's own family already demands its whole stored text.
+fn visit_generic_fallback_runs(
+    label: &text::ResolvedText,
+    primary: &'static str,
+    visit: &mut impl FnMut(&'static str, &str) -> Result<(), FormatEncodeError>,
+) -> Result<(), FormatEncodeError> {
+    for line in &label.lines {
+        for run in &line.runs {
+            let family = match run.font_family {
+                "Liberation Sans" => "Liberation Sans",
+                "Cascadia Code" => "Cascadia Code",
+                _ => continue,
+            };
+            if family != primary {
+                visit(family, &run.display_text)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn visit_svg_font_text(
     scene: &ResolvedScene,
     text_order: &[&ResolvedTextElement],
     mut visit: impl FnMut(&'static str, &str) -> Result<(), FormatEncodeError>,
 ) -> Result<(), FormatEncodeError> {
     for text in text_order {
-        visit(resolved_family(text.font_family), &text.original_text)?;
+        let primary = resolved_family(text.font_family);
+        visit(primary, &text.original_text)?;
+        visit_generic_fallback_runs(&text.text, primary, &mut visit)?;
         if !text.text.missing_codepoints.is_empty() {
             visit("Liberation Sans", "?")?;
         }
@@ -220,6 +247,7 @@ fn visit_svg_font_text(
                     for line in &label.lines {
                         visit("Liberation Sans", &line.display_text)?;
                     }
+                    visit_generic_fallback_runs(label, "Liberation Sans", &mut visit)?;
                 }
             }
             ResolvedElement::Frame(frame) => {

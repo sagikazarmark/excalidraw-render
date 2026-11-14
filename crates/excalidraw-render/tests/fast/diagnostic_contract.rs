@@ -2295,7 +2295,7 @@ fn font_omission_and_zero_extent_contract() {
                 "resource.element-work-exceeded",
                 "max_element_work_units",
                 2000,
-                25152,
+                25184,
                 "work_units",
             ),
         ] {
