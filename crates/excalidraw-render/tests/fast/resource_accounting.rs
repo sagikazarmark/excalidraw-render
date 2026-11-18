@@ -455,7 +455,9 @@ fn font_fallback_probes_charge_the_exact_vector_for_every_fallback_shape() {
     // no probe; otherwise it pays one probe per official font chunk of its
     // family whose declared range covers it, one per Xiaolai chunk likewise
     // when the CJK subset trigger selected Xiaolai, one for the Noto Emoji
-    // consultation, and one for the Liberation Sans replacement glyph. The
+    // consultation, one per generic-family chunk (Liberation Sans, then
+    // Cascadia Code) declaring it, and one for the Liberation Sans replacement
+    // glyph when none of those maps it. The
     // scalar, glyph, and line-step rows are prepaid before shaping; the probe
     // and outline rows are the remainder charged at layout. The outline
     // count is that element's own geometry crossing; every other row is a
@@ -465,9 +467,10 @@ fn font_fallback_probes_charge_the_exact_vector_for_every_fallback_shape() {
         (
             "\u{20a9}",
             1,
-            2,
-            "untriggered missing scalar: no Excalifont chunk declares the won sign, \
-             Noto Emoji lacks it, the replacement glyph serves it",
+            3,
+            "untriggered scalar: no Excalifont chunk declares the won sign, Noto \
+             Emoji lacks it, the Liberation Sans chunk declaring it lacks it, and \
+             Cascadia Code serves it",
         ),
         (
             "\u{4e2d}",
@@ -479,7 +482,7 @@ fn font_fallback_probes_charge_the_exact_vector_for_every_fallback_shape() {
         (
             "\u{1f600}\u{20a9}",
             2,
-            1 + 2,
+            1 + 3,
             "a selected Noto Emoji face is consulted once for the won sign, as an \
              unselected one is",
         ),
@@ -502,15 +505,15 @@ fn font_fallback_probes_charge_the_exact_vector_for_every_fallback_shape() {
 fn font_fallback_probes_do_not_depend_on_which_occurrences_came_before() {
     // Spec 8.3.1 and 13.2: once the family's whole-text face is fixed, the
     // faces already serving the target change neither the probe count nor
-    // the order, so the won sign pays the same two probes whether or not an
+    // the order, so the won sign pays the same three probes whether or not an
     // earlier text occurrence already selected Noto Emoji.
     let alone = excalifont_scene(&[("won", "\u{20a9}")]);
     let after_emoji = excalifont_scene(&[("emoji", "\u{1f600}"), ("won", "\u{20a9}")]);
     let prepaid = 32 * (1 + 1 + 1);
     let (alone_outline, alone_work) = text_element_work_vector(&alone, "won", prepaid);
     let (after_outline, after_work) = text_element_work_vector(&after_emoji, "won", prepaid);
-    assert_eq!(alone_outline, after_outline, "the same replacement glyph");
-    assert_eq!(alone_work, prepaid + 32 * (2 + alone_outline));
+    assert_eq!(alone_outline, after_outline, "the same Cascadia Code glyph");
+    assert_eq!(alone_work, prepaid + 32 * (3 + alone_outline));
     assert_eq!(after_work, alone_work);
 }
 

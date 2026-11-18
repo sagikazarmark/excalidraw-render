@@ -44,6 +44,7 @@ mod frame_export;
 mod frame_field_contract;
 mod frame_render;
 mod freedraw_render;
+mod generic_fallback_render;
 mod geometry_style_contract;
 mod gif_container_contract;
 mod gif_control_contract;

@@ -1302,24 +1302,32 @@ other shaped scalar consults, in this order and stopping at the
 first face whose `cmap` maps it: each official font chunk of the family whose
 declared range covers the scalar, in pinned face order; for Excalifont when the
 trigger selected Xiaolai, each Xiaolai chunk likewise; the complete Noto Emoji
-face; and finally the Liberation Sans chunk declaring `?`, which shapes the
-replacement glyph `?` and reports `font.missing-glyph` for the scalar. A chunk
+face; the generic-family faces, each probed like a family chunk (each chunk
+whose declared range covers the scalar, in pinned face order): Liberation Sans,
+standing in for `sans-serif`, then Cascadia Code, skipping either one when it
+is the element's own family; and finally the Liberation Sans chunk declaring
+`?`, which shapes the replacement glyph `?` and reports `font.missing-glyph`
+for the scalar. The generic-family faces replace the reference's last resort,
+the browser's installed default font, so output stays independent of installed
+fonts; a scalar they map (for example `→`, Greek letters or subscript digits
+under Nunito) is not missing. A chunk
 whose declared range does not cover the scalar is never consulted, so its
 `cmap` never selects it.
 
 Each of those consultations is one font fallback probe, the event 13.2 charges
 32 work units (#122): one for each consulted chunk of the family and, when
-selected, of Xiaolai, one for the Noto Emoji consultation, and one for the
-replacement. Every shaped scalar occurrence pays its own probes, repeated
-scalars included; a default-ignorable code point consults no face and pays
+selected, of Xiaolai, one for the Noto Emoji consultation, one for each
+consulted generic-family chunk, and one for the replacement. Every shaped
+scalar occurrence pays its own probes, repeated scalars included; a default-ignorable code point consults no face and pays
 none. Once the family's whole-text face is fixed, whether a
 consulted face already serves the target changes neither the count nor the
 order; and neither the whole-text face's initial `cmap` test nor a
-declared-range test is a probe. So an untriggered Excalifont scalar that no
-Excalifont chunk declares and Noto Emoji lacks pays two probes; a triggered
+declared-range test is a probe. So the won sign `₩` under Excalifont (no
+Excalifont chunk declares it; Noto Emoji and the Liberation Sans chunk
+declaring it lack it; Cascadia Code maps it) pays three probes; a triggered
 Excalifont scalar that the one Xiaolai chunk declaring it maps pays one; an
 emoji Noto Emoji maps pays one; a Liberation Sans scalar its one chunk declares
-but does not map pays three.
+but does not map pays three, plus one for each Cascadia Code chunk declaring it.
 
 #### 8.3.2 Subset Profile, Names, and Identity
 

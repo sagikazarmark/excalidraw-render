@@ -1278,6 +1278,35 @@ fn resolve_character_font(
         fonts.push(font);
         return Ok((fonts.len() - 1, character, true, false));
     }
+    // The last step of the reference's font fallback: the browser's default
+    // font. The reference's canvas stack is `Nunito, Segoe UI Emoji` (and the
+    // static export's adds `sans-serif` before the emoji face), so a scalar no
+    // family face, Xiaolai or emoji face maps is drawn by whatever installed
+    // font the viewer's browser picks. A renderer that promises output
+    // independent of installed fonts bundles that last resort instead:
+    // Liberation Sans stands in for `sans-serif` (it is already what
+    // Helvetica resolves to), and Cascadia Code, the one bundled face with
+    // Greek, arrows, math and super/subscript digits beyond Liberation's,
+    // catches what remains. Both are probed like any family chunk, and a
+    // scalar they map is not missing. A generic face that is the element's
+    // own family was already consulted above and is not probed again.
+    for (generic_source_family, generic_family) in
+        [(9, FamilyId::Liberation), (3, FamilyId::Cascadia)]
+    {
+        if generic_family == family {
+            continue;
+        }
+        if let Some(index) = select_catalog_font(
+            fonts,
+            generic_source_family,
+            generic_family,
+            character,
+            fallback_probes,
+            loader,
+        )? {
+            return Ok((index, character, false, false));
+        }
+    }
     let replacement =
         select_catalog_font(fonts, 9, FamilyId::Liberation, '?', fallback_probes, loader)?
             .ok_or(LabelError::InvalidFont)?;
